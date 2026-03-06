@@ -1,0 +1,35 @@
+# === Secretos ===
+.env
+.env.*
+!.env.example
+
+# === Datos Intermedios ===
+.tmp/
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# === Node ===
+node_modules/
+
+# === Git internos de skills ===
+skills/**/.git/
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+Thumbs.db
+Desktop.ini
+.DS_Store
