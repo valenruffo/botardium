@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "skills": {
+    "api-documentation": {
+      "source": "supercent-io/skills-template",
+      "sourceType": "github",
+      "computedHash": "6a9d024171da6ee5d8f126dc242a348349782fbe7a0ed65df156eb39b57b5465"
+    },
+    "playwright-best-practices": {
+      "source": "currents-dev/playwright-best-practices-skill",
+      "sourceType": "github",
+      "computedHash": "650ef2a7fb562fbc8f1a8149e9bd0fae08bc24f75b126dbee3a44065e793ca16"
+    },
+    "playwright-cli": {
+      "source": "microsoft/playwright-cli",
+      "sourceType": "github",
+      "computedHash": "d0c9769e2df40ba1f51660294e6833566cec8a0f8c6a6ef5eb922afe3f573ef6"
+    },
+    "playwright-explore-website": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "computedHash": "ac361696198c2db22a0f9d3aa456d2f83c9f0110bf00d6ca529f735395fe3a5c"
+    },
+    "playwright-generate-test": {
+      "source": "github/awesome-copilot",
+      "sourceType": "github",
+      "computedHash": "8f963da3e25f705ff39755b8b990f20da0c0320cb86ac83fcc4d2d4eca91f6e4"
+    },
+    "playwright-skill": {
+      "source": "sickn33/antigravity-awesome-skills",
+      "sourceType": "github",
+      "computedHash": "a88631790e6a0ef2a3fbe70528a2a599357efa63b89729997d79fce08e5dabc3"
+    }
+  }
+}

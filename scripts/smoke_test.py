@@ -1,5 +1,5 @@
 """
-PrimeBot Core - Smoke Test
+Botardium Core - Smoke Test
 ===========================
 Verifica que las dependencias core están instaladas y el entorno es funcional.
 Ejecutar: python scripts/smoke_test.py
@@ -26,7 +26,7 @@ def check_dependency(module_name: str, pip_name: str) -> bool:
 
 def main():
     print("=" * 50)
-    print("🔧 PrimeBot Core - Smoke Test")
+    print("🔧 Botardium Core - Smoke Test")
     print(f"   Python: {sys.version}")
     print("=" * 50)
     print()
