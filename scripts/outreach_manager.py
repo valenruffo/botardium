@@ -18,13 +18,12 @@ import time
 import sys
 from pathlib import Path
 from datetime import datetime
+from scripts.runtime_paths import AGENTS_DIR, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = SOURCE_ROOT
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / ".agents"))
+sys.path.insert(0, str(AGENTS_DIR))
 
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
 EMERGENCY_FLAG = TMP_DIR / "emergency_stop.flag"
 
 # Imports del Core
@@ -35,10 +34,6 @@ from skills.stealth_mod import add_behavior_noise
 from scripts.core_warmer import run_warmeo, _capitalize_to_memoria
 
 logger = logging.getLogger("primebot.outreach")
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
 
 
 def _load_profile() -> dict:

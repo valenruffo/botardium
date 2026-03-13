@@ -24,12 +24,10 @@ import time
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from scripts.runtime_paths import ENV_EXAMPLE_PATH, ENV_PATH, PROFILE_PATH, SESSIONS_DIR, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-SESSIONS_DIR = PROJECT_ROOT / ".agents" / "sessions"
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
+PROJECT_ROOT = SOURCE_ROOT
 
 # Logging
 logging.basicConfig(
@@ -40,10 +38,13 @@ logging.basicConfig(
 logger = logging.getLogger("primebot.session")
 
 # Load .env
-load_dotenv(PROJECT_ROOT / ".env")
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv(ENV_EXAMPLE_PATH)
 
 # Add skill directory to path for imports
-sys.path.insert(0, str(PROJECT_ROOT / ".agents" / "skills"))
+sys.path.insert(0, str(SKILLS_DIR))
 
 
 def _get_username() -> str:
@@ -61,16 +62,22 @@ def _get_username() -> str:
     return username
 
 
-def _get_session_dir(username: str) -> Path:
+def _workspace_prefix(workspace_slug: str | None = None) -> str:
+    slug = str(workspace_slug or os.getenv("BOTARDIUM_WORKSPACE_SLUG") or "default").strip().lower()
+    slug = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in slug).strip("-")
+    return slug or "default"
+
+
+def _get_session_dir(username: str, workspace_slug: str | None = None) -> Path:
     """Retorna el directorio de sesión para una cuenta."""
-    session_dir = SESSIONS_DIR / username
+    session_dir = SESSIONS_DIR / _workspace_prefix(workspace_slug) / username
     session_dir.mkdir(parents=True, exist_ok=True)
     return session_dir
 
 
-def _get_storage_path(username: str) -> Path:
+def _get_storage_path(username: str, workspace_slug: str | None = None) -> Path:
     """Path al archivo de estado de sesión (cookies + storage)."""
-    return _get_session_dir(username) / "storage_state.json"
+    return _get_session_dir(username, workspace_slug) / "storage_state.json"
 
 
 def _load_account_profile() -> dict:
@@ -84,9 +91,9 @@ def _load_account_profile() -> dict:
     return {}
 
 
-def session_exists(username: str) -> bool:
+def session_exists(username: str, workspace_slug: str | None = None) -> bool:
     """Verifica si existe una sesión guardada para la cuenta."""
-    storage_path = _get_storage_path(username)
+    storage_path = _get_storage_path(username, workspace_slug)
     return storage_path.exists() and storage_path.stat().st_size > 100
 
 
@@ -192,7 +199,7 @@ async def load_session(username: str):
     Returns:
         Tuple[browser, context, page] con sesión activa, o None si falla.
     """
-    from stealth_engine import create_stealth_browser
+    from stealth_engine import _launch_chromium_with_fallback, create_stealth_browser
 
     storage_path = _get_storage_path(username)
 
@@ -224,7 +231,7 @@ async def load_session(username: str):
     if proxy:
         launch_kwargs["proxy"] = {"server": proxy}
 
-    browser = await pw.chromium.launch(**launch_kwargs)
+    browser = await _launch_chromium_with_fallback(pw, launch_kwargs)
 
     # Cargar hardware profile si existe, sino usar defaults
     hw_profile_path = _get_session_dir(username) / "hardware_profile.json"

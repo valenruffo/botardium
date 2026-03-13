@@ -1,4 +1,18 @@
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_IMPORT_ROOT = SCRIPT_DIR.parent
+if str(PROJECT_IMPORT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_IMPORT_ROOT))
+
+if len(sys.argv) >= 2 and sys.argv[1] == "--run-warmer":
+    sys.argv.pop(1)
+    from scripts.core_warmer import main as warmer_main
+    sys.exit(warmer_main())
+
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
@@ -7,21 +21,42 @@ import re
 import sqlite3
 import time
 import subprocess
-from pathlib import Path
 from dotenv import load_dotenv
 import openai
 import json
 import asyncio
 import sys
 import traceback
+import shutil
+import zipfile
+import urllib.request
+from packaging.version import Version, InvalidVersion
 from uuid import uuid4
 from datetime import datetime
+from scripts.runtime_paths import (
+    AGENTS_DIR,
+    DB_DIR,
+    ENV_EXAMPLE_PATH,
+    ENV_PATH,
+    PROFILE_PATH,
+    SKILLS_DIR,
+    TMP_DIR,
+    SESSIONS_DIR,
+    WRITABLE_ROOT,
+)
+
+try:
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
+except Exception:
+    google_genai = None
+    google_genai_types = None
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(PROJECT_ROOT / ".agents" / "skills"))
+PROJECT_ROOT = WRITABLE_ROOT
+sys.path.append(str(SKILLS_DIR))
 from stealth_engine import create_stealth_browser, close_stealth_browser
 
 app = FastAPI(
@@ -42,16 +77,334 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_DIR = PROJECT_ROOT / "database"
-DB_DIR.mkdir(exist_ok=True)
-DB_PATH = DB_DIR / "primebot.db"
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
+LEGACY_DB_PATH = DB_DIR / "primebot.db"
+DB_PATH = DB_DIR / "botardium.db"
+
+if LEGACY_DB_PATH.exists() and not DB_PATH.exists():
+    LEGACY_DB_PATH.replace(DB_PATH)
+
+
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _slugify_workspace_name(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug or f"workspace-{int(time.time())}"
+
+
+def _workspace_slug(workspace_id: int) -> str:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT workspace_slug FROM users WHERE id = ?", (workspace_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    return str(row["workspace_slug"] or f"workspace-{workspace_id}")
+
+
+def _workspace_name(workspace_id: int) -> str:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT workspace_name, full_name, email FROM users WHERE id = ?", (workspace_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    return str(row["workspace_name"] or row["full_name"] or row["email"] or f"Workspace {workspace_id}")
+
+
+def _set_workspace_env(workspace_id: int) -> tuple[str | None, str | None]:
+    prev_id = os.environ.get("BOTARDIUM_WORKSPACE_ID")
+    prev_slug = os.environ.get("BOTARDIUM_WORKSPACE_SLUG")
+    os.environ["BOTARDIUM_WORKSPACE_ID"] = str(workspace_id)
+    os.environ["BOTARDIUM_WORKSPACE_SLUG"] = _workspace_slug(workspace_id)
+    return prev_id, prev_slug
+
+
+def _restore_workspace_env(previous: tuple[str | None, str | None]) -> None:
+    prev_id, prev_slug = previous
+    if prev_id is None:
+        os.environ.pop("BOTARDIUM_WORKSPACE_ID", None)
+    else:
+        os.environ["BOTARDIUM_WORKSPACE_ID"] = prev_id
+    if prev_slug is None:
+        os.environ.pop("BOTARDIUM_WORKSPACE_SLUG", None)
+    else:
+        os.environ["BOTARDIUM_WORKSPACE_SLUG"] = prev_slug
+
+
+def _workspace_ai_config(workspace_id: Optional[int]) -> Dict[str, str]:
+    google_key = GOOGLE_API_KEY
+    openai_key = os.getenv("OPENAI_API_KEY", "") or ""
+    if not workspace_id:
+        return {
+            "google_api_key": google_key.strip(),
+            "openai_api_key": openai_key.strip(),
+        }
+
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT google_api_key, openai_api_key FROM users WHERE id = ?",
+        (int(workspace_id),),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        google_key = str(row["google_api_key"] or google_key or "").strip()
+        openai_key = str(row["openai_api_key"] or openai_key or "").strip()
+    return {
+        "google_api_key": google_key,
+        "openai_api_key": openai_key,
+    }
+
+
+def _workspace_ai_status(workspace_id: Optional[int]) -> Dict[str, Any]:
+    config = _workspace_ai_config(workspace_id)
+    has_google = bool(config["google_api_key"])
+    has_openai = bool(config["openai_api_key"])
+    return {
+        "google_configured": has_google,
+        "openai_configured": has_openai,
+        "magic_box_enabled": has_google or has_openai,
+        "message_studio_enabled": has_google or has_openai,
+        "lead_drafts_enabled": has_google or has_openai,
+        "recommended_provider": "google" if has_google else ("openai" if has_openai else None),
+        "google_label": "Google AI Studio (gratis para empezar)",
+        "openai_label": "OpenAI",
+    }
+
+
+def _mask_key(value: str) -> str:
+    key = str(value or "").strip()
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _downloads_dir() -> Path:
+    return Path.home() / "Downloads"
+
+
+def _workspace_session_dir(workspace_slug: str) -> Path:
+    return SESSIONS_DIR / workspace_slug
+
+
+def _version_tuple(value: str) -> Version:
+    normalized = str(value or "0.0.0").strip().lstrip("v")
+    try:
+        return Version(normalized)
+    except InvalidVersion:
+        return Version("0.0.0")
+
+
+def _current_app_version() -> str:
+    version_file = PROJECT_ROOT / "botardium-panel" / "web" / "src-tauri" / "tauri.conf.json"
+    if version_file.exists():
+        try:
+            return str(json.loads(version_file.read_text(encoding="utf-8")).get("version") or "1.0.0")
+        except Exception:
+            pass
+    return "1.0.0"
+
+
+def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> List[str]:
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return [str(row[1]) for row in cursor.fetchall()]
+
+
+def _copy_workspace_sessions(workspace_slug: str, destination: Path) -> None:
+    source = _workspace_session_dir(workspace_slug)
+    if source.exists():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def _build_workspace_export(workspace_id: int) -> Path:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users WHERE id = ?", (workspace_id,))
+    workspace = cursor.fetchone()
+    if not workspace:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+
+    workspace_slug = str(workspace["workspace_slug"] or f"workspace-{workspace_id}")
+    workspace_name = str(workspace["workspace_name"] or workspace["full_name"] or workspace["email"] or workspace_slug)
+    export_root = TMP_DIR / "workspace_exports" / f"{workspace_slug}-{int(time.time())}"
+    if export_root.exists():
+        shutil.rmtree(export_root, ignore_errors=True)
+    export_root.mkdir(parents=True, exist_ok=True)
+
+    cursor.execute("SELECT * FROM ig_accounts WHERE user_id = ? ORDER BY id ASC", (workspace_id,))
+    accounts = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT * FROM leads WHERE workspace_id = ? ORDER BY id ASC", (workspace_id,))
+    leads = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT * FROM campaigns_cache WHERE workspace_id = ? ORDER BY updated_at DESC", (workspace_id,))
+    campaigns = [dict(row) for row in cursor.fetchall()]
+    cursor.execute("SELECT * FROM message_jobs_cache WHERE workspace_id = ? ORDER BY updated_at DESC", (workspace_id,))
+    jobs = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    payload = {
+        "version": 1,
+        "exported_at": datetime.now().isoformat(),
+        "workspace": dict(workspace),
+        "ig_accounts": accounts,
+        "leads": leads,
+        "campaigns_cache": campaigns,
+        "message_jobs_cache": jobs,
+    }
+    (export_root / "workspace.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _copy_workspace_sessions(workspace_slug, export_root / "sessions")
+
+    downloads_dir = _downloads_dir()
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = downloads_dir / f"botardium-workspace-{workspace_slug}.zip"
+    if archive_path.exists():
+        archive_path.unlink()
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for file_path in export_root.rglob("*"):
+            if file_path.is_file():
+                archive.write(file_path, file_path.relative_to(export_root))
+    return archive_path
+
+
+def _import_workspace_archive(zip_path: str) -> Dict[str, Any]:
+    source = Path(zip_path)
+    if not source.exists() or source.suffix.lower() != ".zip":
+        raise HTTPException(status_code=400, detail="Selecciona un ZIP de workspace válido.")
+
+    import_root = TMP_DIR / "workspace_imports" / f"import-{int(time.time())}"
+    if import_root.exists():
+        shutil.rmtree(import_root, ignore_errors=True)
+    import_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(source, "r") as archive:
+        archive.extractall(import_root)
+
+    payload_path = import_root / "workspace.json"
+    if not payload_path.exists():
+        raise HTTPException(status_code=400, detail="El archivo no contiene un workspace exportado por Botardium.")
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    workspace_payload = payload.get("workspace") or {}
+    requested_name = str(workspace_payload.get("workspace_name") or workspace_payload.get("full_name") or "Workspace importado").strip()
+
+    conn = _connect_db()
+    cursor = conn.cursor()
+    base_slug = _slugify_workspace_name(requested_name)
+    cursor.execute("SELECT workspace_slug FROM users WHERE workspace_slug LIKE ?", (f"{base_slug}%",))
+    existing = {str(row[0]) for row in cursor.fetchall()}
+    slug = base_slug
+    suffix = 2
+    while slug in existing:
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
+    synthetic_email = f"{slug}@botardium.local"
+    cursor.execute(
+        "INSERT INTO users (email, password_hash, full_name, workspace_name, workspace_slug, is_workspace, google_api_key, openai_api_key) VALUES (?, '', ?, ?, ?, 1, ?, ?)",
+        (
+            synthetic_email,
+            requested_name,
+            requested_name,
+            slug,
+            str(workspace_payload.get("google_api_key") or ""),
+            str(workspace_payload.get("openai_api_key") or ""),
+        ),
+    )
+    new_workspace_id = int(cursor.lastrowid)
+
+    account_id_map: Dict[int, int] = {}
+    for account in payload.get("ig_accounts", []):
+        record = dict(account)
+        old_account_id = int(record.pop("id"))
+        record["user_id"] = new_workspace_id
+        columns = list(record.keys())
+        placeholders = ", ".join("?" for _ in columns)
+        cursor.execute(
+            f"INSERT INTO ig_accounts ({', '.join(columns)}) VALUES ({placeholders})",
+            [record[column] for column in columns],
+        )
+        account_id_map[old_account_id] = int(cursor.lastrowid)
+
+    campaign_id_map: Dict[str, str] = {}
+    for campaign in payload.get("campaigns_cache", []):
+        old_campaign_id = str(campaign.get("id"))
+        new_campaign_id = str(uuid4())
+        campaign_id_map[old_campaign_id] = new_campaign_id
+        campaign_payload = json.loads(str(campaign.get("payload") or "{}"))
+        campaign_payload["id"] = new_campaign_id
+        campaign_payload["workspace_id"] = new_workspace_id
+        cursor.execute(
+            "INSERT INTO campaigns_cache (id, workspace_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+            (new_campaign_id, new_workspace_id, json.dumps(campaign_payload, ensure_ascii=False), campaign.get("updated_at") or datetime.now().isoformat()),
+        )
+
+    for lead in payload.get("leads", []):
+        record = dict(lead)
+        record.pop("id", None)
+        record["workspace_id"] = new_workspace_id
+        if record.get("ig_account_id") is not None:
+            record["ig_account_id"] = account_id_map.get(int(record["ig_account_id"]))
+        if record.get("campaign_id"):
+            record["campaign_id"] = campaign_id_map.get(str(record["campaign_id"]), record["campaign_id"])
+        columns = list(record.keys())
+        placeholders = ", ".join("?" for _ in columns)
+        cursor.execute(
+            f"INSERT INTO leads ({', '.join(columns)}) VALUES ({placeholders})",
+            [record[column] for column in columns],
+        )
+
+    for job in payload.get("message_jobs_cache", []):
+        new_job_id = str(uuid4())
+        job_payload = json.loads(str(job.get("payload") or "{}"))
+        job_payload["id"] = new_job_id
+        job_payload["workspace_id"] = new_workspace_id
+        if job_payload.get("campaign_id"):
+            job_payload["campaign_id"] = campaign_id_map.get(str(job_payload["campaign_id"]), job_payload["campaign_id"])
+        cursor.execute(
+            "INSERT INTO message_jobs_cache (id, workspace_id, payload, updated_at) VALUES (?, ?, ?, ?)",
+            (new_job_id, new_workspace_id, json.dumps(job_payload, ensure_ascii=False), job.get("updated_at") or datetime.now().isoformat()),
+        )
+
+    conn.commit()
+    conn.close()
+
+    session_source = import_root / "sessions"
+    if session_source.exists():
+        shutil.copytree(session_source, _workspace_session_dir(slug), dirs_exist_ok=True)
+
+    return {"workspace_id": new_workspace_id, "name": requested_name, "slug": slug}
+
+
+def _latest_release_status(current_version: str) -> Dict[str, Any]:
+    current = _version_tuple(current_version)
+    latest_url = "https://api.github.com/repos/valenruffo/botardium/releases/latest"
+    try:
+        request = urllib.request.Request(latest_url, headers={"Accept": "application/vnd.github+json", "User-Agent": "Botardium-Updater"})
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return {"ok": False, "detail": f"No pude consultar GitHub Releases: {exc}", "current_version": current_version}
+
+    latest_version = str(payload.get("tag_name") or payload.get("name") or current_version).lstrip("v")
+    assets = payload.get("assets") or []
+    installer = next((asset for asset in assets if str(asset.get("name") or "").lower().endswith("setup.exe")), None)
+    return {
+        "ok": True,
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "update_available": _version_tuple(latest_version) > current,
+        "download_url": installer.get("browser_download_url") if installer else payload.get("html_url"),
+        "release_url": payload.get("html_url"),
+        "notes": str(payload.get("body") or "")[:1200],
+    }
 
 # Inicializar Base de Datos (Seguridad & Relaciones)
 def init_db():
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = _connect_db()
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout = 10000")
@@ -61,9 +414,35 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            full_name TEXT
+            full_name TEXT,
+            workspace_name TEXT,
+            workspace_slug TEXT,
+            is_workspace INTEGER DEFAULT 1,
+            google_api_key TEXT,
+            openai_api_key TEXT
         )
     ''')
+    cursor.execute("PRAGMA table_info(users)")
+    user_columns = {row[1] for row in cursor.fetchall()}
+    if "workspace_name" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN workspace_name TEXT")
+    if "workspace_slug" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN workspace_slug TEXT")
+    if "is_workspace" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_workspace INTEGER DEFAULT 1")
+    if "google_api_key" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN google_api_key TEXT")
+    if "openai_api_key" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT")
+    cursor.execute("SELECT id, full_name, email, workspace_name, workspace_slug FROM users")
+    for row in cursor.fetchall():
+        row_id = int(row[0])
+        workspace_name = str(row[3] or row[1] or row[2] or f"Workspace {row_id}")
+        workspace_slug = str(row[4] or _slugify_workspace_name(workspace_name))
+        cursor.execute(
+            "UPDATE users SET workspace_name = ?, workspace_slug = ?, is_workspace = 1 WHERE id = ?",
+            (workspace_name, workspace_slug, row_id),
+        )
     # Tabla de Cuentas de Instagram conectadas
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS ig_accounts (
@@ -117,6 +496,8 @@ def init_db():
         cursor.execute("ALTER TABLE leads ADD COLUMN sent_at TEXT")
     if "follow_up_due_at" not in lead_columns:
         cursor.execute("ALTER TABLE leads ADD COLUMN follow_up_due_at TEXT")
+    if "workspace_id" not in lead_columns:
+        cursor.execute("ALTER TABLE leads ADD COLUMN workspace_id INTEGER")
     cursor.execute("PRAGMA table_info(ig_accounts)")
     account_columns = {row[1] for row in cursor.fetchall()}
     if "warmup_status" not in account_columns:
@@ -157,7 +538,107 @@ def init_db():
         cursor.execute("ALTER TABLE leads ADD COLUMN last_outreach_error TEXT")
     if "last_message_rationale" not in lead_columns:
         cursor.execute("ALTER TABLE leads ADD COLUMN last_message_rationale TEXT")
+    cursor.execute(
+        """
+        UPDATE leads
+        SET workspace_id = (
+            SELECT user_id FROM ig_accounts WHERE ig_accounts.id = leads.ig_account_id
+        )
+        WHERE workspace_id IS NULL AND ig_account_id IS NOT NULL
+        """
+    )
+    cursor.execute("SELECT COUNT(*) FROM users")
+    workspace_count = int(cursor.fetchone()[0])
+    if workspace_count == 1:
+        cursor.execute("SELECT id FROM users LIMIT 1")
+        only_workspace_id = int(cursor.fetchone()[0])
+        cursor.execute("UPDATE leads SET workspace_id = ? WHERE workspace_id IS NULL", (only_workspace_id,))
+
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS campaigns_cache (
+            id TEXT PRIMARY KEY,
+            workspace_id INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        '''
+    )
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS message_jobs_cache (
+            id TEXT PRIMARY KEY,
+            workspace_id INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        '''
+    )
     cursor.execute("UPDATE leads SET status = 'Completado' WHERE status = 'Contactado'")
+    conn.commit()
+    conn.close()
+
+
+def _ensure_leads_workspace_safe_schema() -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'leads'")
+    row = cursor.fetchone()
+    create_sql = str(row[0] or "") if row else ""
+    if "UNIQUE" not in create_sql.upper():
+        conn.close()
+        return
+
+    cursor.execute("PRAGMA table_info(leads)")
+    existing_columns = {str(col[1]) for col in cursor.fetchall()}
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS leads_workspace_migration (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ig_account_id INTEGER,
+            username TEXT,
+            status TEXT DEFAULT 'Pendiente',
+            source TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            ig_username TEXT,
+            created_at TEXT,
+            campaign_id TEXT,
+            full_name TEXT,
+            bio TEXT,
+            contacted_at TEXT,
+            last_message_preview TEXT,
+            message_prompt TEXT,
+            message_variant TEXT,
+            sent_at TEXT,
+            follow_up_due_at TEXT,
+            workspace_id INTEGER,
+            last_outreach_result TEXT,
+            last_outreach_error TEXT,
+            last_message_rationale TEXT
+        )
+        '''
+    )
+    ordered_columns = [
+        "id", "ig_account_id", "username", "status", "source", "timestamp", "ig_username", "created_at", "campaign_id",
+        "full_name", "bio", "contacted_at", "last_message_preview", "message_prompt", "message_variant", "sent_at",
+        "follow_up_due_at", "workspace_id", "last_outreach_result", "last_outreach_error", "last_message_rationale",
+    ]
+    insert_columns = [column for column in ordered_columns if column in existing_columns]
+    select_columns = []
+    for column in ordered_columns:
+        if column in existing_columns:
+            select_columns.append(column)
+        elif column == "ig_username" and "username" in existing_columns:
+            select_columns.append("username AS ig_username")
+            insert_columns.append("ig_username") if "ig_username" not in insert_columns else None
+        elif column == "created_at" and "timestamp" in existing_columns:
+            select_columns.append("timestamp AS created_at")
+            insert_columns.append("created_at") if "created_at" not in insert_columns else None
+    cursor.execute(
+        f"INSERT INTO leads_workspace_migration ({', '.join(insert_columns)}) SELECT {', '.join(select_columns)} FROM leads"
+    )
+    cursor.execute("DROP TABLE leads")
+    cursor.execute("ALTER TABLE leads_workspace_migration RENAME TO leads")
     conn.commit()
     conn.close()
 
@@ -195,30 +676,49 @@ def cleanup_legacy_message_previews() -> int:
 @app.on_event("startup")
 def startup_event():
     init_db()
+    _ensure_leads_workspace_safe_schema()
+    _load_persisted_runtime_state()
     cleanup_legacy_message_previews()
 
 # Cargar variables de entorno locales
-env_path = PROJECT_ROOT / ".env"
-if env_path.exists():
-    load_dotenv(env_path)
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
 else:
-    load_dotenv(PROJECT_ROOT / ".env.example")
+    load_dotenv(ENV_EXAMPLE_PATH)
 
 openai.api_key = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 
 # ----------------------------------------------------- #
 # Models
 # ----------------------------------------------------- #
 class MagicBoxRequest(BaseModel):
+    workspace_id: Optional[int] = None
     prompt: str
+
+
+class WorkspaceAiSettingsRequest(BaseModel):
+    google_api_key: str = ""
+    openai_api_key: str = ""
+
+
+class WorkspaceImportRequest(BaseModel):
+    zip_path: str
 
 class StrategySourceResponse(BaseModel):
     type: str
     target: str
 
+
+class StrategyFilterContext(BaseModel):
+    intent_summary: str = ""
+    include_terms: List[str] = []
+    exclude_terms: List[str] = []
+
 class MagicBoxResponse(BaseModel):
     sources: List[StrategySourceResponse]
     reasoning: str
+    filter_context: StrategyFilterContext = StrategyFilterContext()
 
 class BotConfig(BaseModel):
     username: str
@@ -233,8 +733,10 @@ class TargetSource(BaseModel):
 
 
 class CampaignStartRequest(BaseModel):
+    workspace_id: int
     username: str
     campaign_name: Optional[str] = None
+    strategy_context: Optional[StrategyFilterContext] = None
     sources: List[TargetSource]
     limit: int = 50
     warmup_mode: str = "auto"
@@ -259,6 +761,7 @@ class LeadBulkRequest(BaseModel):
 
 
 class MessageStudioRequest(BaseModel):
+    workspace_id: Optional[int] = None
     ids: List[int]
     prompt: str = ""
     prompt_first_contact: Optional[str] = None
@@ -273,6 +776,7 @@ class LeadDraftUpdateRequest(BaseModel):
 
 
 class LeadRegenerateDraftRequest(BaseModel):
+    workspace_id: Optional[int] = None
     prompt_first_contact: Optional[str] = None
     prompt_follow_up_1: Optional[str] = None
     prompt_follow_up_2: Optional[str] = None
@@ -281,6 +785,7 @@ class LeadRegenerateDraftRequest(BaseModel):
 
 
 class MessageQueueRequest(BaseModel):
+    workspace_id: int
     ids: List[int]
     prompt: str = ""
     prompt_first_contact: Optional[str] = None
@@ -293,6 +798,7 @@ class MessageQueueRequest(BaseModel):
 
 
 class MessageRunRequest(BaseModel):
+    workspace_id: int
     ids: List[int] = []
     dry_run: bool = False
     campaign_id: Optional[str] = None
@@ -309,21 +815,15 @@ class AccountProfileUpdateRequest(BaseModel):
 
 
 class AccountBulkWarmupRequest(BaseModel):
-    user_id: int
+    workspace_id: int
     duration_min: int = 10
     account_ids: List[int] = []
 
-class AuthRegisterReq(BaseModel):
-    email: str
-    password: str
-    full_name: Optional[str] = "Admin"
-
-class AuthLoginReq(BaseModel):
-    email: str
-    password: str
+class WorkspaceCreateReq(BaseModel):
+    name: str
 
 class AccountAddReq(BaseModel):
-    user_id: int
+    workspace_id: int
     ig_username: str
     ig_password: str
 
@@ -338,12 +838,100 @@ ACCOUNT_WARMUP_TASKS: Dict[int, asyncio.Task] = {}
 MESSAGE_JOB_STORE: Dict[str, Dict[str, Any]] = {}
 
 
+def _persist_campaign(campaign: Dict[str, Any]) -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO campaigns_cache (id, workspace_id, payload, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET workspace_id = excluded.workspace_id, payload = excluded.payload, updated_at = excluded.updated_at
+        """,
+        (
+            campaign["id"],
+            int(campaign.get("workspace_id") or 0),
+            json.dumps(campaign, ensure_ascii=False),
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _delete_campaign(campaign_id: str) -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM campaigns_cache WHERE id = ?", (campaign_id,))
+    conn.commit()
+    conn.close()
+
+
+def _persist_message_job(job: Dict[str, Any]) -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO message_jobs_cache (id, workspace_id, payload, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET workspace_id = excluded.workspace_id, payload = excluded.payload, updated_at = excluded.updated_at
+        """,
+        (
+            job["id"],
+            int(job.get("workspace_id") or 0),
+            json.dumps(job, ensure_ascii=False),
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _load_persisted_runtime_state() -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT payload FROM campaigns_cache ORDER BY updated_at DESC")
+    for row in cursor.fetchall():
+        try:
+            campaign = json.loads(str(row["payload"] or "{}"))
+            if not campaign.get("id"):
+                continue
+            if campaign.get("status") in {"running", "warmup"}:
+                campaign["status"] = "paused"
+                campaign["current_action"] = "Botardium se reinicio. Revisa esta campaña antes de continuar."
+            CAMPAIGN_STORE[str(campaign["id"])] = campaign
+        except Exception:
+            continue
+    cursor.execute("SELECT payload FROM message_jobs_cache ORDER BY updated_at DESC")
+    for row in cursor.fetchall():
+        try:
+            job = json.loads(str(row["payload"] or "{}"))
+            if not job.get("id"):
+                continue
+            if job.get("status") in {"queued", "running"}:
+                job["status"] = "error"
+                job["current_action"] = "Botardium se reinicio antes de terminar este job."
+            MESSAGE_JOB_STORE[str(job["id"])] = job
+        except Exception:
+            continue
+    conn.close()
+
+
 def _append_campaign_log(campaign: Dict[str, Any], message: str) -> None:
     campaign.setdefault("logs", []).insert(0, {
         "message": message,
         "timestamp": int(time.time()),
     })
     campaign["logs"] = campaign["logs"][:12]
+    if campaign.get("id"):
+        _persist_campaign(campaign)
+
+
+def _workspace_campaigns(workspace_id: int) -> List[Dict[str, Any]]:
+    return [campaign for campaign in CAMPAIGN_STORE.values() if int(campaign.get("workspace_id") or 0) == int(workspace_id)]
+
+
+def _workspace_jobs(workspace_id: int) -> List[Dict[str, Any]]:
+    return [job for job in MESSAGE_JOB_STORE.values() if int(job.get("workspace_id") or 0) == int(workspace_id)]
 
 
 def _count_leads() -> int:
@@ -566,7 +1154,7 @@ async def _run_account_warmup(account_id: int, username: str, duration_min: int,
     worker = subprocess.Popen(
         [
             sys.executable,
-            str(PROJECT_ROOT / "scripts" / "core_warmer.py"),
+            "--run-warmer",
             "--duration",
             str(duration_min),
             "--username",
@@ -702,14 +1290,14 @@ async def _run_campaign_warmup(campaign_id: str) -> None:
     await _run_account_warmup(int(account["id"]), campaign["username"], int(campaign["warmup_minutes"]), linked_campaign_id=campaign_id)
 
 
-async def _save_instagram_session(username: str, context) -> None:
+async def _save_instagram_session(username: str, context, workspace_slug: Optional[str] = None) -> None:
     from scripts.session_manager import _get_session_dir, _get_storage_path
 
-    storage_path = _get_storage_path(username)
+    storage_path = _get_storage_path(username, workspace_slug)
     await context.storage_state(path=str(storage_path))
     cookies = await context.cookies("https://www.instagram.com")
     session_cookies = [c["name"] for c in cookies if c.get("name") in ("sessionid", "ds_user_id")]
-    meta_path = _get_session_dir(username) / "session_meta.json"
+    meta_path = _get_session_dir(username, workspace_slug) / "session_meta.json"
     meta_path.write_text(json.dumps({
         "username": username,
         "created_at": datetime.now().isoformat(),
@@ -842,6 +1430,7 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
+                previous_env = _set_workspace_env(int(campaign.get("workspace_id") or 0))
                 try:
                     return loop.run_until_complete(
                         run_scraper(
@@ -854,6 +1443,7 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                         )
                     )
                 finally:
+                    _restore_workspace_env(previous_env)
                     loop.close()
 
             scraper_task = asyncio.create_task(asyncio.to_thread(_run_scraper_isolated))
@@ -1187,17 +1777,48 @@ def _build_lead_context_for_llm(lead: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_prompt: str) -> Dict[str, Any]:
+def _extract_json_from_text(raw: str) -> Dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    return json.loads(text)
+
+
+def _generate_gemini_message_bundle(system_prompt: str, user_payload: Dict[str, Any], google_api_key: str) -> Optional[Dict[str, Any]]:
+    if not google_api_key or google_genai is None or google_genai_types is None:
+        return None
+
+    try:
+        client = google_genai.Client(api_key=google_api_key)
+        response = client.models.generate_content(
+            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+            contents=json.dumps(user_payload, ensure_ascii=False),
+            config=google_genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.8,
+                response_mime_type="application/json",
+            ),
+        )
+        return _extract_json_from_text(getattr(response, "text", "") or "")
+    except Exception:
+        return None
+
+
+def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_prompt: str, workspace_id: Optional[int] = None) -> Dict[str, Any]:
+    ai_config = _workspace_ai_config(workspace_id)
+    google_api_key = ai_config["google_api_key"]
+    openai_api_key = ai_config["openai_api_key"]
     context = _build_lead_context_for_llm(lead)
     fallback_message = _generate_personalized_message(lead, stage_prompt)
     fallback_bundle = {
         "message": _sanitize_message_output(fallback_message),
         "rationale": "Fallback local: mensaje breve basado en prompt maestro + etapa.",
         "variant": context["variant"],
+        "provider": "local_fallback",
     }
-
-    if not openai.api_key:
-        return fallback_bundle
 
     system_prompt = """
     Eres un copywriter senior de outreach para Instagram en español rioplatense/neutro.
@@ -1228,8 +1849,29 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
         "lead_context": context,
     }
 
+    gemini_data = _generate_gemini_message_bundle(system_prompt, user_payload, google_api_key)
+    if isinstance(gemini_data, dict) and gemini_data:
+        message = _sanitize_message_output(str(gemini_data.get("message") or "").strip())
+        rationale = str(gemini_data.get("rationale") or "").strip()
+        variant = str(gemini_data.get("variant") or context["variant"]).strip()
+        if message and len(message) >= 35:
+            issues = _validate_message_quality(message)
+            if not issues:
+                if variant not in {"first_contact", "follow_up_1", "follow_up_2"}:
+                    variant = context["variant"]
+                return {
+                    "message": message,
+                    "rationale": rationale or "Mensaje generado por Gemini con tono humano y CTA suave.",
+                    "variant": variant,
+                    "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+                }
+
+    if not openai_api_key:
+        return fallback_bundle
+
     try:
-        response = openai.chat.completions.create(
+        client = openai.OpenAI(api_key=openai_api_key)
+        response = client.chat.completions.create(
             model=os.getenv("OPENAI_MESSAGE_MODEL", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -1255,6 +1897,7 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
             "message": message,
             "rationale": rationale or "Mensaje generado por IA con tono humano y CTA suave.",
             "variant": variant,
+            "provider": os.getenv("OPENAI_MESSAGE_MODEL", "gpt-4o-mini"),
         }
     except Exception:
         return fallback_bundle
@@ -1266,7 +1909,7 @@ def _bundle_for_lead_with_payload(lead: Dict[str, Any], payload: MessageStudioRe
     if not prompt_for_variant:
         raise HTTPException(status_code=400, detail=f"Falta prompt para {variant}.")
     master_prompt = _resolve_master_prompt(payload)
-    bundle = _generate_ai_message_bundle(lead, prompt_for_variant, master_prompt)
+    bundle = _generate_ai_message_bundle(lead, prompt_for_variant, master_prompt, getattr(payload, "workspace_id", None))
     issues = _validate_message_quality(bundle["message"])
     bundle["quality_flags"] = issues
     bundle["variant"] = bundle.get("variant") or variant
@@ -1338,6 +1981,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
                 "timestamp": int(time.time()),
             })
             job["logs"] = job["logs"][:12]
+        _persist_message_job(job)
 
     try:
         job["status"] = "running"
@@ -1352,6 +1996,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            previous_env = _set_workspace_env(int(job.get("workspace_id") or 0))
 
             async def sync_progress_hook(update: Dict[str, Any]):
                 if main_loop and not main_loop.is_closed():
@@ -1367,6 +2012,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
                     )
                 )
             finally:
+                _restore_workspace_env(previous_env)
                 loop.close()
 
         result = await asyncio.to_thread(_run_isolated_outreach)
@@ -1388,6 +2034,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
         }
         job["current_action"] = f"Outreach completado. {sent} DM(s) enviados{' en dry run' if dry_run else ''}."
         job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
+        _persist_message_job(job)
     except Exception as exc:
         import traceback
         err_str = traceback.format_exc()
@@ -1397,6 +2044,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
         job["current_lead"] = None
         job["current_action"] = f"Error en outreach: {exc}"[:150]
         job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time()), "details": err_str})
+        _persist_message_job(job)
 
 
 def _infer_strategy_fallback(prompt: str) -> MagicBoxResponse:
@@ -1432,11 +2080,49 @@ def _normalize_hashtag_target(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_]", "", str(value or "").replace("#", "").strip().lower())
 
 
+def _normalize_intent_text(value: str) -> str:
+    lowered = str(value or "").lower()
+    return lowered.replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+
 GEO_ALIAS_MAP: Dict[str, List[str]] = {
     "buenosaires": ["bsas", "caba", "baires"],
     "ciudaddebuenosaires": ["caba", "bsas", "baires"],
     "ciudaddemexico": ["cdmx", "mx"],
 }
+
+INTENT_STOPWORDS = {
+    "busco", "buscar", "quiero", "necesito", "gente", "personas", "cuentas", "leads", "prospectos",
+    "de", "del", "la", "las", "el", "los", "en", "para", "con", "sin", "por", "que", "y", "o",
+    "una", "un", "unos", "unas", "mi", "tu", "su", "sus", "al", "a", "desde", "hasta",
+}
+
+
+def _normalize_filter_terms(values: Any) -> List[str]:
+    normalized: List[str] = []
+    seen: set[str] = set()
+    if not isinstance(values, list):
+        return normalized
+    for raw in values:
+        term = _normalize_intent_text(str(raw or "").strip())
+        if not term or term in seen or len(term) < 3:
+            continue
+        seen.add(term)
+        normalized.append(term)
+    return normalized[:12]
+
+
+def _infer_filter_context_from_prompt(prompt: str) -> StrategyFilterContext:
+    normalized = _normalize_intent_text(prompt)
+    raw_tokens = re.findall(r"[a-z0-9]+", normalized)
+    include_terms: List[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        if len(token) < 4 or token in INTENT_STOPWORDS or token in seen:
+            continue
+        seen.add(token)
+        include_terms.append(token)
+    return StrategyFilterContext(intent_summary=prompt.strip()[:120], include_terms=include_terms[:10], exclude_terms=[])
 
 TRUNCATED_HASHTAG_PATTERNS = (
     "buenosaire",
@@ -1479,6 +2165,7 @@ def _strategy_hashtag_variants(value: str) -> List[str]:
 def _normalize_strategy_payload(data: Dict[str, Any], prompt: str) -> MagicBoxResponse:
     raw_sources = data.get("sources") or []
     reasoning = str(data.get("reasoning") or "").strip()
+    raw_filter_context = data.get("filter_context") or {}
 
     normalized_sources: List[StrategySourceResponse] = []
     if isinstance(raw_sources, list):
@@ -1513,51 +2200,94 @@ def _normalize_strategy_payload(data: Dict[str, Any], prompt: str) -> MagicBoxRe
     if not reasoning:
         reasoning = "Este objetivo fue elegido por afinidad de nicho, senales de compra y menor ruido que un hashtag generico. Se incluyen variantes morfologicas para reducir falsos no-encontrados."
 
-    return MagicBoxResponse(sources=normalized_sources[:3], reasoning=reasoning)
+    filter_context = _infer_filter_context_from_prompt(prompt)
+    if isinstance(raw_filter_context, dict):
+        ai_summary = str(raw_filter_context.get("intent_summary") or "").strip()
+        ai_include = _normalize_filter_terms(raw_filter_context.get("include_terms"))
+        ai_exclude = _normalize_filter_terms(raw_filter_context.get("exclude_terms"))
+        filter_context = StrategyFilterContext(
+            intent_summary=ai_summary or filter_context.intent_summary,
+            include_terms=ai_include or filter_context.include_terms,
+            exclude_terms=ai_exclude,
+        )
+
+    return MagicBoxResponse(sources=normalized_sources[:3], reasoning=reasoning, filter_context=filter_context)
+
 
 # ----------------------------------------------------- #
-# Endpoints de Autenticación & Cuentas (SaaS Core)
+# Workspaces locales (modelo desktop local-first)
 # ----------------------------------------------------- #
-import hashlib
-
-def hash_pass(pwd: str) -> str:
-    return hashlib.sha256(pwd.encode()).hexdigest()
-
-@app.post("/api/auth/register")
-async def register_user(req: AuthRegisterReq):
-    try:
-        conn = sqlite3.connect(str(DB_PATH))
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (email, password_hash, full_name) VALUES (?, ?, ?)", 
-                       (req.email.lower(), hash_pass(req.password), req.full_name))
-        user_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        return {"user_id": user_id, "email": req.email, "message": "Cuenta registrada con éxito"}
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=400, detail="El email ya está registrado")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/auth/login")
-async def login_user(req: AuthLoginReq):
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+@app.get("/api/workspaces")
+async def list_workspaces():
+    conn = _connect_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, email, full_name FROM users WHERE email = ? AND password_hash = ?", 
-                   (req.email.lower(), hash_pass(req.password)))
-    user = cursor.fetchone()
+    cursor.execute(
+        "SELECT id, workspace_name, workspace_slug, full_name, email FROM users WHERE is_workspace = 1 ORDER BY id DESC"
+    )
+    rows = cursor.fetchall()
     conn.close()
-    
-    if not user:
-        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-    
-    return {"user_id": user["id"], "email": user["email"], "full_name": user["full_name"]}
+    return {
+        "workspaces": [
+            {
+                "id": int(row["id"]),
+                "name": str(row["workspace_name"] or row["full_name"] or row["email"] or f"Workspace {row['id']}"),
+                "slug": str(row["workspace_slug"] or _slugify_workspace_name(str(row["workspace_name"] or row["full_name"] or row["email"] or row["id"]))),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.post("/api/workspaces")
+async def create_workspace(req: WorkspaceCreateReq):
+    workspace_name = str(req.name or "").strip()
+    if len(workspace_name) < 2:
+        raise HTTPException(status_code=400, detail="El nombre del workspace debe tener al menos 2 caracteres.")
+
+    base_slug = _slugify_workspace_name(workspace_name)
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT workspace_slug FROM users WHERE workspace_slug LIKE ?", (f"{base_slug}%",))
+    existing = {str(row[0]) for row in cursor.fetchall()}
+    slug = base_slug
+    suffix = 2
+    while slug in existing:
+        slug = f"{base_slug}-{suffix}"
+        suffix += 1
+
+    synthetic_email = f"{slug}@botardium.local"
+    cursor.execute(
+        "INSERT INTO users (email, password_hash, full_name, workspace_name, workspace_slug, is_workspace) VALUES (?, '', ?, ?, ?, 1)",
+        (synthetic_email, workspace_name, workspace_name, slug),
+    )
+    workspace_id = int(cursor.lastrowid)
+    conn.commit()
+    conn.close()
+    return {"workspace_id": workspace_id, "name": workspace_name, "slug": slug}
+
+
+@app.post("/api/workspaces/{workspace_id}/export")
+async def export_workspace(workspace_id: int):
+    archive_path = _build_workspace_export(workspace_id)
+    return {
+        "status": "exported",
+        "path": str(archive_path),
+        "filename": archive_path.name,
+    }
+
+
+@app.post("/api/workspaces/import")
+async def import_workspace(payload: WorkspaceImportRequest):
+    return _import_workspace_archive(payload.zip_path)
+
+
+@app.get("/api/app/update-status")
+async def get_app_update_status(current_version: Optional[str] = None):
+    return _latest_release_status(current_version or _current_app_version())
 
 @app.get("/api/accounts")
-async def get_accounts(user_id: int):
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
+async def get_accounts(workspace_id: int):
+    conn = _connect_db()
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -1585,14 +2315,14 @@ async def get_accounts(user_id: int):
         WHERE user_id = ?
         ORDER BY id DESC
         """,
-        (user_id,),
+        (workspace_id,),
     )
     rows = cursor.fetchall()
     conn.close()
     return [_serialize_account(row) for row in rows]
 
 class LoginBrowserReq(BaseModel):
-    user_id: int
+    workspace_id: int
 
 
 async def _wait_for_instagram_login(context, page, timeout_seconds: int = 180) -> None:
@@ -1664,12 +2394,13 @@ async def login_browser(req: LoginBrowserReq):
     
     ig_username = None
     try:
+        workspace_slug = _workspace_slug(req.workspace_id)
         await page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
         await _wait_for_instagram_login(context, page)
         ig_username = await _extract_instagram_username(page)
-        await _save_instagram_session(ig_username, context)
+        await _save_instagram_session(ig_username, context, workspace_slug)
         print(f"Usuario extraido: {ig_username}")
 
     except HTTPException as he:
@@ -1685,7 +2416,7 @@ async def login_browser(req: LoginBrowserReq):
         cursor = conn.cursor()
         cursor.execute(
             "SELECT id FROM ig_accounts WHERE user_id = ? AND ig_username = ?",
-            (req.user_id, ig_username)
+            (req.workspace_id, ig_username)
         )
         if cursor.fetchone():
             conn.close()
@@ -1697,7 +2428,7 @@ async def login_browser(req: LoginBrowserReq):
                 account_type, account_warmup_status, account_warmup_days_total, account_warmup_days_completed, daily_dm_limit
             ) VALUES (?, ?, '', 'verified', 'mature', 'completed', 0, 0, 20)
             """,
-            (req.user_id, ig_username)
+            (req.workspace_id, ig_username)
         )
         acc_id = cursor.lastrowid
         conn.commit()
@@ -1725,12 +2456,12 @@ async def bulk_account_warmup(payload: AccountBulkWarmupRequest):
         placeholders = ",".join("?" for _ in payload.account_ids)
         cursor.execute(
             f"SELECT * FROM ig_accounts WHERE user_id = ? AND id IN ({placeholders}) ORDER BY id DESC",
-            [payload.user_id, *payload.account_ids],
+            [payload.workspace_id, *payload.account_ids],
         )
     else:
         cursor.execute(
             "SELECT * FROM ig_accounts WHERE user_id = ? AND (warmup_required = 1 OR warmup_status IN ('idle', 'error')) ORDER BY id DESC",
-            (payload.user_id,),
+            (payload.workspace_id,),
         )
     rows = cursor.fetchall()
     conn.close()
@@ -1742,7 +2473,7 @@ async def bulk_account_warmup(payload: AccountBulkWarmupRequest):
         task = ACCOUNT_WARMUP_TASKS.get(account_id)
         if task and not task.done():
             continue
-        if not session_exists(account["ig_username"]):
+        if not session_exists(account["ig_username"], _workspace_slug(int(account["user_id"]))):
             _update_account_runtime(
                 account_id,
                 warmup_status="error",
@@ -1814,7 +2545,7 @@ async def warmup_account(account_id: int, payload: AccountWarmupRequest):
     if not account:
         raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
 
-    if not session_exists(account["ig_username"]):
+    if not session_exists(account["ig_username"], _workspace_slug(int(account["user_id"]))):
         _update_account_runtime(
             account_id,
             warmup_status="error",
@@ -1950,8 +2681,11 @@ async def generate_strategy(payload: MagicBoxRequest):
     Magic Box Brain: Procesa un input de lenguaje natural 
     y utiliza OpenAI para determinar la estrategia de scraping óptima.
     """
-    if not openai.api_key:
-        raise HTTPException(status_code=500, detail="Falta configurar OPENAI_API_KEY en el archivo .env")
+    ai_config = _workspace_ai_config(payload.workspace_id)
+    openai_api_key = ai_config["openai_api_key"]
+    google_api_key = ai_config["google_api_key"]
+    if not openai_api_key and not google_api_key:
+        raise HTTPException(status_code=412, detail="Necesitas API keys para usar Magic Box. Configúralas en API Keys.")
 
     system_prompt = '''
     Eres Botardium AI, el cerebro estrategico de MoveUp para prospeccion en Instagram.
@@ -1973,7 +2707,12 @@ async def generate_strategy(payload: MagicBoxRequest):
       "sources": [
         {"type": "hashtag", "target": "valor sin @ ni #"}
       ],
-      "reasoning": "maximo 2 frases, concretas y estrategicas"
+      "reasoning": "maximo 2 frases, concretas y estrategicas",
+      "filter_context": {
+        "intent_summary": "resumen corto del nicho buscado",
+        "include_terms": ["terminos positivos del nicho"],
+        "exclude_terms": ["terminos claros de rubro incorrecto"]
+      }
     }
 
     Reglas duras:
@@ -1981,28 +2720,71 @@ async def generate_strategy(payload: MagicBoxRequest):
     - Cada target nunca puede ser vacio.
     - Todos los sources deben ser type=hashtag.
     - hashtag = hashtag sin #.
+    - `include_terms` y `exclude_terms` deben ser utiles para filtrar perfiles reales del nicho pedido por el usuario.
+    - `include_terms` debe incluir sinonimos y formas naturales del nicho, no solo el hashtag literal.
     - No inventes placeholders como undefined, null, none o n/a.
     - Si el usuario menciona ciudad o pais, intenta devolver un hashtag unico que combine nicho + geografia cuando sea natural.
     '''
 
     try:
-        response = openai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": payload.prompt}
-            ],
-            response_format={ "type": "json_object" },
-            temperature=0.2
-        )
-        
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        return _normalize_strategy_payload(data, payload.prompt)
-        
+        if openai_api_key:
+            client = openai.OpenAI(api_key=openai_api_key)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": payload.prompt}
+                ],
+                response_format={ "type": "json_object" },
+                temperature=0.2
+            )
+            content = response.choices[0].message.content or "{}"
+            data = json.loads(content)
+            return _normalize_strategy_payload(data, payload.prompt)
+
+        if google_api_key and google_genai is not None and google_genai_types is not None:
+            client = google_genai.Client(api_key=google_api_key)
+            response = client.models.generate_content(
+                model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+                contents=payload.prompt,
+                config=google_genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                ),
+            )
+            return _normalize_strategy_payload(_extract_json_from_text(getattr(response, "text", "") or "{}"), payload.prompt)
+
     except Exception as e:
         print(f"Error AI: {e}")
         return _infer_strategy_fallback(payload.prompt)
+
+
+@app.get("/api/workspaces/{workspace_id}/ai-settings")
+async def get_workspace_ai_settings(workspace_id: int):
+    config = _workspace_ai_config(workspace_id)
+    status = _workspace_ai_status(workspace_id)
+    return {
+        "google_api_key": _mask_key(config["google_api_key"]),
+        "openai_api_key": _mask_key(config["openai_api_key"]),
+        **status,
+    }
+
+
+@app.post("/api/workspaces/{workspace_id}/ai-settings")
+async def update_workspace_ai_settings(workspace_id: int, payload: WorkspaceAiSettingsRequest):
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE users SET google_api_key = ?, openai_api_key = ? WHERE id = ?",
+        ((payload.google_api_key or "").strip(), (payload.openai_api_key or "").strip(), workspace_id),
+    )
+    conn.commit()
+    changed = cursor.rowcount
+    conn.close()
+    if not changed:
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    return {"status": "saved", **_workspace_ai_status(workspace_id)}
 
 # ----------------------------------------------------- #
 # Endpoints de Bot Engine Core
@@ -2060,6 +2842,8 @@ async def start_bot(config: CampaignStartRequest):
 
     campaign = {
         "id": campaign_id,
+        "workspace_id": int(config.workspace_id),
+        "workspace_name": _workspace_name(int(config.workspace_id)),
         "campaign_name": normalized_name[:80],
         "username": config.username,
         "limit": normalized_limit,
@@ -2072,6 +2856,7 @@ async def start_bot(config: CampaignStartRequest):
             "require_identity": bool(config.require_identity),
             "require_keyword_match": bool(config.require_keyword_match),
             "require_coherence": bool(config.require_coherence),
+            "strategy_context": (config.strategy_context.model_dump() if config.strategy_context else StrategyFilterContext().model_dump()),
         },
         "filter_profile": filter_profile,
         "warmup_mode": warmup_mode,
@@ -2085,6 +2870,7 @@ async def start_bot(config: CampaignStartRequest):
     }
     _append_campaign_log(campaign, initial_action)
     CAMPAIGN_STORE[campaign_id] = campaign
+    _persist_campaign(campaign)
 
     return {
         "status": "started",
@@ -2092,11 +2878,12 @@ async def start_bot(config: CampaignStartRequest):
     }
 
 @app.get("/api/bot/status")
-async def get_bot_status():
+async def get_bot_status(workspace_id: int):
     """Retorna el progreso en tiempo real (Polling)."""
+    campaigns = _workspace_campaigns(workspace_id)
     return {
-        "is_running": any(campaign.get("status") == "running" for campaign in CAMPAIGN_STORE.values()),
-        "campaigns": [_serialize_campaign(campaign) for campaign in CAMPAIGN_STORE.values()],
+        "is_running": any(campaign.get("status") == "running" for campaign in campaigns),
+        "campaigns": [_serialize_campaign(campaign) for campaign in campaigns],
     }
 
 
@@ -2118,6 +2905,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         conn.commit()
         conn.close()
         del CAMPAIGN_STORE[campaign_id]
+        _delete_campaign(campaign_id)
         return {"status": "deleted", "campaign_id": campaign_id}
 
     if action == "rename":
@@ -2126,6 +2914,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
             raise HTTPException(status_code=400, detail="Debes escribir un nombre de campaña.")
         campaign["campaign_name"] = normalized_name[:80]
         _append_campaign_log(campaign, f"Nombre de campaña actualizado a: {campaign['campaign_name']}")
+        _persist_campaign(campaign)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_warmup":
@@ -2137,6 +2926,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["progress"] = 5
         campaign["current_action"] = f"Warmup real en cola ({campaign['warmup_minutes']} min)"
         _append_campaign_log(campaign, campaign["current_action"])
+        _persist_campaign(campaign)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "finish_warmup":
@@ -2144,6 +2934,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["progress"] = 35
         campaign["current_action"] = "Warmup completo. Lista para comenzar scraping."
         _append_campaign_log(campaign, campaign["current_action"])
+        _persist_campaign(campaign)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_scraping":
@@ -2161,16 +2952,16 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["status"] = "paused"
         campaign["current_action"] = f"Scraping pausado en {int(campaign.get('progress') or 0)}%. Puedes reanudar cuando quieras."
         _append_campaign_log(campaign, campaign["current_action"])
+        _persist_campaign(campaign)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     raise HTTPException(status_code=400, detail="Accion no soportada.")
 
 @app.get("/api/leads")
-async def get_leads(campaign_id: Optional[str] = None):
+async def get_leads(workspace_id: int, campaign_id: Optional[str] = None):
     """Retorna los datos del CRM desde SQLite/Postgres."""
     try:
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
+        conn = _connect_db()
         cursor = conn.cursor()
         base_query = """
             SELECT
@@ -2195,8 +2986,11 @@ async def get_leads(campaign_id: Optional[str] = None):
         """
         params: List[Any] = []
         if campaign_id:
-            base_query += " WHERE campaign_id = ?"
-            params.append(campaign_id)
+            base_query += " WHERE workspace_id = ? AND campaign_id = ?"
+            params.extend([workspace_id, campaign_id])
+        else:
+            base_query += " WHERE workspace_id = ?"
+            params.append(workspace_id)
         base_query += " ORDER BY created_at DESC LIMIT 200"
         cursor.execute(base_query, params)
         rows = cursor.fetchall()
@@ -2273,6 +3067,8 @@ async def update_lead_draft(lead_id: int, payload: LeadDraftUpdateRequest):
 
 @app.post("/api/leads/{lead_id}/regenerate-draft")
 async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftRequest):
+    if not _workspace_ai_status(payload.workspace_id).get("lead_drafts_enabled"):
+        raise HTTPException(status_code=412, detail="Necesitas API keys para regenerar borradores con IA. Configúralas en API Keys.")
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -2298,12 +3094,15 @@ async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftReques
         "message": bundle["message"],
         "rationale": bundle["rationale"],
         "variant": bundle["variant"],
+        "provider": bundle.get("provider", "unknown"),
         "quality_flags": bundle.get("quality_flags", []),
     }
 
 
 @app.post("/api/messages/preview")
 async def preview_messages(payload: MessageStudioRequest):
+    if not _workspace_ai_status(payload.workspace_id).get("message_studio_enabled"):
+        raise HTTPException(status_code=412, detail="Necesitas API keys para generar mensajes con IA. Configúralas en API Keys.")
     if not payload.ids:
         raise HTTPException(status_code=400, detail="Debes seleccionar al menos un lead.")
     if not any([
@@ -2319,8 +3118,8 @@ async def preview_messages(payload: MessageStudioRequest):
     cursor = conn.cursor()
     placeholders = ",".join("?" for _ in payload.ids)
     cursor.execute(
-        f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE id IN ({placeholders}) ORDER BY created_at DESC",
-        payload.ids,
+        f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
+        [payload.workspace_id, *payload.ids],
     )
     rows = [dict(row) for row in cursor.fetchall()]
 
@@ -2335,6 +3134,7 @@ async def preview_messages(payload: MessageStudioRequest):
             "status": lead.get("status"),
             "rationale": bundle["rationale"],
             "variant": bundle["variant"],
+            "provider": bundle.get("provider", "unknown"),
             "quality_flags": bundle.get("quality_flags", []),
         })
         cursor.execute(
@@ -2349,6 +3149,8 @@ async def preview_messages(payload: MessageStudioRequest):
 
 @app.post("/api/messages/queue")
 async def queue_messages(payload: MessageQueueRequest):
+    if not _workspace_ai_status(payload.workspace_id).get("message_studio_enabled"):
+        raise HTTPException(status_code=412, detail="Necesitas API keys para actualizar borradores con IA. Configúralas en API Keys.")
     if not payload.ids:
         raise HTTPException(status_code=400, detail="Debes seleccionar al menos un lead.")
     if not any([
@@ -2364,8 +3166,8 @@ async def queue_messages(payload: MessageQueueRequest):
     cursor = conn.cursor()
     placeholders = ",".join("?" for _ in payload.ids)
     cursor.execute(
-        f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE id IN ({placeholders}) ORDER BY created_at DESC",
-        payload.ids,
+        f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
+        [payload.workspace_id, *payload.ids],
     )
     rows = [dict(row) for row in cursor.fetchall()]
     if not rows:
@@ -2375,6 +3177,7 @@ async def queue_messages(payload: MessageQueueRequest):
     job_id = str(uuid4())
     job = {
         "id": job_id,
+        "workspace_id": int(payload.workspace_id),
         "status": "queued",
         "progress": 0,
         "campaign_id": payload.campaign_id,
@@ -2387,11 +3190,13 @@ async def queue_messages(payload: MessageQueueRequest):
         "logs": [],
     }
     MESSAGE_JOB_STORE[job_id] = job
+    _persist_message_job(job)
 
     now = datetime.now()
     follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
     for idx, lead in enumerate(rows, start=1):
         studio_payload = MessageStudioRequest(
+            workspace_id=payload.workspace_id,
             ids=[lead["id"]],
             prompt=payload.prompt,
             prompt_first_contact=payload.prompt_first_contact,
@@ -2432,11 +3237,13 @@ async def queue_messages(payload: MessageQueueRequest):
         job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
         job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
         job["logs"] = job["logs"][:12]
+        _persist_message_job(job)
 
     conn.commit()
     conn.close()
     job["status"] = "completed"
     job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
+    _persist_message_job(job)
     return {"status": "queued", "job": _serialize_message_job(job)}
 
 
@@ -2457,7 +3264,8 @@ async def run_message_queue(payload: MessageRunRequest):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     params: List[Any] = []
-    query = "SELECT id FROM leads WHERE status IN ('Listo para contactar', 'Primer contacto', 'Follow-up 1')"
+    query = "SELECT id FROM leads WHERE workspace_id = ? AND status IN ('Listo para contactar', 'Primer contacto', 'Follow-up 1')"
+    params.append(payload.workspace_id)
     if payload.ids:
         placeholders = ",".join("?" for _ in payload.ids)
         query += f" AND id IN ({placeholders})"
@@ -2496,6 +3304,7 @@ async def run_message_queue(payload: MessageRunRequest):
     eta_seconds = max(60, int((eta_min_seconds + eta_max_seconds) / 2))
     job = {
         "id": job_id,
+        "workspace_id": int(payload.workspace_id),
         "kind": "outreach",
         "status": "queued",
         "progress": 0,
@@ -2513,13 +3322,14 @@ async def run_message_queue(payload: MessageRunRequest):
         "logs": [],
     }
     MESSAGE_JOB_STORE[job_id] = job
+    _persist_message_job(job)
     asyncio.create_task(_run_message_outreach_job(job_id, lead_ids, payload.dry_run, payload.campaign_id))
     return {"status": "started", "job": _serialize_message_job(job)}
 
 
 @app.get("/api/messages/jobs")
-async def get_message_jobs():
-    jobs = sorted(MESSAGE_JOB_STORE.values(), key=lambda job: job["created_at"], reverse=True)
+async def get_message_jobs(workspace_id: int):
+    jobs = sorted(_workspace_jobs(workspace_id), key=lambda job: job["created_at"], reverse=True)
     return {"jobs": [_serialize_message_job(job) for job in jobs[:20]]}
 
 if __name__ == "__main__":

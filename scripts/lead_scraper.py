@@ -6,7 +6,7 @@ Mas rapido y seguro que parsear HTML.
 Incluye filtros de calidad basados en bio (Keywords).
 
 Consulta: directivas/memoria_maestra.md
-Output: database/primebot.db
+Output: database/botardium.db
 
 Uso:
     python scripts/lead_scraper.py --target hashtag --query "marketing" --limit 50
@@ -17,6 +17,7 @@ import asyncio
 import json
 import argparse
 import logging
+import os
 import re
 import sys
 import time
@@ -24,23 +25,30 @@ import random
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict
+from scripts.runtime_paths import PROFILE_PATH, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
 
 # Paths
-API_ROOT = Path(__file__).resolve().parent.parent
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+API_ROOT = SOURCE_ROOT
+PROJECT_ROOT = SOURCE_ROOT
 sys.path.insert(0, str(API_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / ".agents" / "skills"))
+sys.path.insert(0, str(SKILLS_DIR))
 
-TMP_DIR = PROJECT_ROOT / ".tmp"
 STATUS_FILE = TMP_DIR / "scraper_status.json"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Imports del Core
 from scripts.session_manager import load_or_create_session
 from db_manager import DatabaseManager
 
+try:
+    from google import genai as google_genai
+    from google.genai import types as google_genai_types
+except Exception:
+    google_genai = None
+    google_genai_types = None
+
 logger = logging.getLogger("primebot.scraper")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GEMINI_NICHE_CACHE: dict[str, tuple[bool, str]] = {}
 
 MIN_FOLLOWERS = 80
 MIN_POSTS = 3
@@ -114,9 +122,61 @@ def _adaptive_cooldown(failure_streak: int) -> float:
     return random.uniform(0.8, 1.5)
 
 
+def _extract_post_owners_from_json(data: Any) -> list[dict[str, Any]]:
+    """Extract post owner user objects from Instagram's API/GraphQL responses.
+
+    Unlike _extract_users_from_json (which looks for user lists), this searches
+    for post→owner patterns in the JSON tree, extracting the profile of whoever
+    authored each post.  This is the key to reliable hashtag scraping.
+    """
+    owners: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            # Pattern 1: GraphQL post with owner
+            owner = node.get("owner")
+            if isinstance(owner, dict) and owner.get("username"):
+                un = str(owner["username"])
+                if un not in seen:
+                    seen.add(un)
+                    owners.append(owner)
+
+            # Pattern 2: API v1 media with user
+            user = node.get("user")
+            if isinstance(user, dict) and user.get("username") and user.get("pk"):
+                un = str(user["username"])
+                if un not in seen:
+                    seen.add(un)
+                    owners.append(user)
+
+            # Pattern 3: caption → user (API v1 media items)
+            caption = node.get("caption")
+            if isinstance(caption, dict):
+                cap_user = caption.get("user")
+                if isinstance(cap_user, dict) and cap_user.get("username") and cap_user.get("pk"):
+                    un = str(cap_user["username"])
+                    if un not in seen:
+                        seen.add(un)
+                        owners.append(cap_user)
+
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(data)
+    return owners
+
+
 async def _extract_author_via_grid_click(page, href: str, own_username: str, source_url: str) -> str | None:
     target_href = href if href.startswith("/") else f"/{href.lstrip('/')}"
     cleaned = target_href.split("?", 1)[0].split("#", 1)[0]
+
+    # Try direct navigation to the post URL first (more reliable than click)
+    # Extract the post shortcode from href
+    post_url = f"https://www.instagram.com{cleaned}" if cleaned.startswith("/") else cleaned
 
     clicked = False
     try:
@@ -145,8 +205,27 @@ async def _extract_author_via_grid_click(page, href: str, own_username: str, sou
         ))
         if not clicked:
             return None
-        await asyncio.sleep(2.5)
-        candidate_username = await asyncio.wait_for(_extract_post_author_username(page, own_username), timeout=5)
+        await asyncio.sleep(2.0)
+
+        # Try DOM-based extraction first
+        candidate_username = await asyncio.wait_for(_extract_post_author_username(page, own_username), timeout=4)
+
+        # If DOM extraction failed, try meta tag extraction (more reliable)
+        if not candidate_username:
+            try:
+                og_title = await page.evaluate(
+                    """() => document.querySelector('meta[property="og:title"]')?.getAttribute('content') || ''"""
+                )
+                # Instagram og:title format: "Full Name (@username) • Instagram photo"
+                # or "username on Instagram: ..."
+                if og_title:
+                    at_match = re.search(r"@([a-zA-Z0-9_.]+)", og_title)
+                    if at_match:
+                        candidate_username = at_match.group(1).lower()
+                    elif " on Instagram" in og_title:
+                        candidate_username = og_title.split(" on Instagram")[0].strip().lower()
+            except Exception:
+                pass
     except Exception:
         candidate_username = None
     finally:
@@ -164,6 +243,8 @@ async def _extract_author_via_grid_click(page, href: str, own_username: str, sou
             except Exception:
                 pass
 
+    if candidate_username and candidate_username == own_username:
+        return None
     return candidate_username
 
 
@@ -487,41 +568,263 @@ def _normalize_text(value: str) -> str:
     return lowered
 
 
-def _source_tokens(source_value: str) -> list[str]:
+# Geographic abbreviations for compound hashtag splitting
+_GEO_ABBREVS: dict[str, list[str]] = {
+    "bsas": ["buenos aires", "bsas"],
+    "buenosaires": ["buenos aires"],
+    "caba": ["capital federal", "caba", "buenos aires"],
+    "cdmx": ["ciudad de mexico", "cdmx", "mexico"],
+    "ciudaddemexico": ["ciudad de mexico", "cdmx", "mexico"],
+    "mexico": ["mexico", "ciudad de mexico", "cdmx"],
+    "arg": ["argentina"],
+    "argentina": ["argentina"],
+    "rosario": ["rosario"],
+    "cordoba": ["cordoba"],
+    "mendoza": ["mendoza"],
+    "miami": ["miami"],
+    "bogota": ["bogota"],
+    "lima": ["lima"],
+    "santiago": ["santiago"],
+    "medellin": ["medellin"],
+    "montevideo": ["montevideo"],
+}
+
+# Domain-specific semantic expansions
+_DOMAIN_TERMS: dict[str, list[str]] = {
+    "constructora": ["constructora", "constructoras", "construccion", "obra", "obras", "edificio", "arquitectura", "ingeniero", "ingenieria", "desarrollo inmobiliario", "proyecto"],
+    "inmobili": ["inmobiliaria", "inmobiliario", "broker", "propiedades", "real estate", "realtor", "bienes raices"],
+    "broker": ["broker", "brokers", "realtor", "realtors", "asesor", "asesores", "agente", "agentes", "broker inmobiliario", "asesor inmobiliario", "agente inmobiliario", "real estate", "propiedades"],
+    "estetica": ["estetica", "esteticas", "belleza", "dermatologia", "skincare", "cosmetologia", "tratamiento facial", "clinica estetica"],
+    "odontolog": ["odontologo", "odontologia", "dental", "dentista", "clinica dental", "ortodoncia"],
+    "abogad": ["abogado", "abogados", "abogada", "estudio juridico", "derecho", "legal", "bufete"],
+    "contador": ["contador", "contadora", "contadores", "contabilidad", "estudio contable", "impuestos"],
+    "arquitect": ["arquitecto", "arquitecta", "arquitectura", "estudio de arquitectura", "diseno", "proyecto"],
+    "gimnasio": ["gimnasio", "gym", "fitness", "entrenamiento", "crossfit", "personal trainer"],
+    "restaurant": ["restaurante", "restaurant", "gastronomia", "chef", "cocina", "comida"],
+}
+
+
+def _split_compound_hashtag(normalized: str) -> list[str]:
+    """Split a compound hashtag like 'constructorasbsas' into meaningful components."""
+    parts: list[str] = []
+    remaining = normalized
+
+    # Try to find geographic suffixes first (greedy, longest match)
+    for geo in sorted(_GEO_ABBREVS.keys(), key=len, reverse=True):
+        if remaining.endswith(geo) and len(remaining) > len(geo):
+            domain_part = remaining[:-len(geo)]
+            if len(domain_part) >= 3:
+                parts.append(domain_part)
+                parts.extend(_GEO_ABBREVS[geo])
+                remaining = ""
+                break
+
+    # If no geo suffix found, try geo prefixes
+    if remaining:
+        for geo in sorted(_GEO_ABBREVS.keys(), key=len, reverse=True):
+            if remaining.startswith(geo) and len(remaining) > len(geo):
+                domain_part = remaining[len(geo):]
+                if len(domain_part) >= 3:
+                    parts.extend(_GEO_ABBREVS[geo])
+                    parts.append(domain_part)
+                    remaining = ""
+                    break
+
+    if remaining:
+        parts.append(remaining)
+
+    return parts
+
+
+def _source_tokens_split(source_value: str) -> tuple[list[str], list[str]]:
+    """Return (domain_tokens, geo_tokens) from a source hashtag/query.
+
+    Domain tokens indicate niche relevance (constructora, construccion, obra, ...).
+    Geo tokens indicate location only (buenos aires, bsas, ...) and must NOT
+    be used to bypass niche filtering.
+    """
     normalized = _normalize_text(source_value)
     tokens = re.findall(r"[a-z0-9]+", normalized)
-    expanded: list[str] = []
+    domain: list[str] = []
+    geo: list[str] = []
+
+    # Collect all known geo terms
+    all_geo_terms: set[str] = set()
+    for geo_key, geo_expansions in _GEO_ABBREVS.items():
+        all_geo_terms.add(geo_key)
+        for g in geo_expansions:
+            all_geo_terms.add(g)
+
+    # Process each raw token and also try to split compound words
+    all_fragments: list[str] = []
     for token in tokens:
-        expanded.append(token)
-        if token.endswith("s") and len(token) > 5:
-            expanded.append(token[:-1])
-        if token.startswith("broker"):
-            expanded.extend(["broker", "brokers", "realtor", "realtors", "asesor", "asesores", "agente", "agentes"])
-        if "inmobili" in token:
-            expanded.extend(["inmobiliaria", "inmobiliario", "broker", "propiedades"])
-        if "broker" in token:
-            expanded.extend(["broker", "realtor", "asesor"])
-        if token in {"mexico", "cdmx", "ciudaddemexico"}:
-            expanded.extend(["mexico", "ciudad de mexico", "cdmx", "df"])
+        all_fragments.append(token)
+        if len(token) > 6:
+            split_parts = _split_compound_hashtag(token)
+            if len(split_parts) > 1:
+                all_fragments.extend(split_parts)
 
-    joined = " ".join(tokens)
-    if "broker" in joined and "inmobili" in joined:
-        expanded.extend([
-            "broker",
-            "brokers",
-            "broker inmobiliario",
-            "brokers inmobiliarios",
-            "asesor inmobiliario",
-            "asesores inmobiliarios",
-            "agente inmobiliario",
-            "agentes inmobiliarios",
-            "realtor",
-            "realtors",
-            "real estate",
-            "propiedades",
-        ])
+    for token in all_fragments:
+        is_geo = token in all_geo_terms
 
-    return list(dict.fromkeys([token for token in expanded if len(token) >= 4]))
+        if is_geo:
+            geo.append(token)
+            if token in _GEO_ABBREVS:
+                geo.extend(_GEO_ABBREVS[token])
+        else:
+            domain.append(token)
+            # Singular/plural variants
+            if token.endswith("s") and len(token) > 5:
+                domain.append(token[:-1])
+            elif token.endswith("es") and len(token) > 6:
+                domain.append(token[:-2])
+            elif len(token) >= 4 and not token.endswith("s"):
+                domain.append(f"{token}s")
+
+            # Domain semantic expansion
+            for domain_key, domain_expansions in _DOMAIN_TERMS.items():
+                if domain_key in token:
+                    domain.extend(domain_expansions)
+                    break
+
+    domain_deduped = list(dict.fromkeys([t for t in domain if len(t) >= 3]))
+    geo_deduped = list(dict.fromkeys([t for t in geo if len(t) >= 3]))
+    return domain_deduped, geo_deduped
+
+
+def _source_tokens(source_value: str) -> list[str]:
+    """Backwards-compatible: returns all tokens (domain + geo)."""
+    domain, geo = _source_tokens_split(source_value)
+    combined = domain + geo
+    return list(dict.fromkeys(combined))
+
+
+def _term_variants(term: str) -> list[str]:
+    normalized = _normalize_text(term)
+    variants = [normalized]
+    compact = normalized.replace(" ", "")
+    if compact != normalized:
+        variants.append(compact)
+    if normalized.endswith("s") and len(normalized) > 5:
+        variants.append(normalized[:-1])
+    else:
+        variants.append(f"{normalized}s")
+    if normalized.endswith("es") and len(normalized) > 6:
+        variants.append(normalized[:-2])
+    return list(dict.fromkeys([value for value in variants if len(value) >= 3]))
+
+
+def _strategy_context_terms(filters: dict[str, Any]) -> tuple[list[str], list[str]]:
+    context = filters.get("strategy_context") or {}
+    if not isinstance(context, dict):
+        return [], []
+
+    include_terms: list[str] = []
+    exclude_terms: list[str] = []
+    for raw in context.get("include_terms") or []:
+        include_terms.extend(_term_variants(str(raw or "")))
+    for raw in context.get("exclude_terms") or []:
+        exclude_terms.extend(_term_variants(str(raw or "")))
+
+    include_terms = list(dict.fromkeys([term for term in include_terms if len(term) >= 3]))[:24]
+    exclude_terms = list(dict.fromkeys([term for term in exclude_terms if len(term) >= 3]))[:24]
+    return include_terms, exclude_terms
+
+
+def _normalize_context_values(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        term = _normalize_text(str(raw or "").strip())
+        if len(term) < 3 or term in seen:
+            continue
+        seen.add(term)
+        normalized.append(term)
+    return normalized[:24]
+
+
+def _count_term_hits(profile_text: str, terms: list[str]) -> int:
+    hits = 0
+    for term in terms:
+        if term and term in profile_text:
+            hits += 1
+    return hits
+
+
+def _extract_json_dict(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gemini_niche_decision(user: dict[str, Any], filters: dict[str, Any], source_value: str) -> tuple[bool, str] | None:
+    if not GOOGLE_API_KEY or google_genai is None or google_genai_types is None:
+        return None
+
+    context = filters.get("strategy_context") or {}
+    if not isinstance(context, dict):
+        return None
+
+    intent_summary = str(context.get("intent_summary") or "").strip()
+    include_terms = _normalize_context_values(context.get("include_terms") or [])
+    exclude_terms = _normalize_context_values(context.get("exclude_terms") or [])
+    if not intent_summary and not include_terms:
+        return None
+
+    profile_payload = {
+        "username": str(user.get("username") or "").strip(),
+        "full_name": str(user.get("full_name") or "").strip(),
+        "bio": str(user.get("biography") or "").strip(),
+        "source": source_value,
+        "followers": int(_extract_metric(user, ("follower_count",), ("edge_followed_by", "count"))),
+        "posts": int(_extract_metric(user, ("media_count",), ("edge_owner_to_timeline_media", "count"))),
+        "intent_summary": intent_summary,
+        "include_terms": include_terms,
+        "exclude_terms": exclude_terms,
+    }
+    cache_key = json.dumps(profile_payload, ensure_ascii=True, sort_keys=True)
+    if cache_key in GEMINI_NICHE_CACHE:
+        return GEMINI_NICHE_CACHE[cache_key]
+
+    system_prompt = """
+    Eres un clasificador de relevancia de nicho para leads de Instagram.
+    Debes decidir si el perfil pertenece realmente al nicho pedido por el usuario.
+
+    Reglas:
+    - Acepta solo si el perfil parece pertenecer al nicho principal pedido.
+    - Rechaza cuentas adyacentes, medios, tiendas o rubros vecinos si no encajan claramente.
+    - Basa la decision en username, full_name y bio.
+    - Devuelve JSON exacto: {"accept": true|false, "reason": "breve"}
+    """
+
+    try:
+        client = google_genai.Client(api_key=GOOGLE_API_KEY)
+        response = client.models.generate_content(
+            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+            contents=json.dumps(profile_payload, ensure_ascii=False),
+            config=google_genai_types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.1,
+                response_mime_type="application/json",
+            ),
+        )
+        parsed = _extract_json_dict(getattr(response, "text", "") or "")
+        decision = bool(parsed.get("accept"))
+        reason = str(parsed.get("reason") or "Clasificacion Gemini").strip()[:120]
+        GEMINI_NICHE_CACHE[cache_key] = (decision, reason)
+        return decision, reason
+    except Exception:
+        return None
 
 
 def _coherence_mismatch(profile_text: str, source_tokens: list[str], has_keyword: bool, source_match: bool) -> bool:
@@ -540,6 +843,21 @@ def _coherence_mismatch(profile_text: str, source_tokens: list[str], has_keyword
         if term in profile_text:
             mismatch_hits += 1
     return mismatch_hits >= 2
+
+
+def _context_niche_mismatch(profile_text: str, include_terms: list[str], exclude_terms: list[str]) -> bool:
+    if not include_terms:
+        return False
+    positive_hits = _count_term_hits(profile_text, include_terms)
+    negative_hits = _count_term_hits(profile_text, exclude_terms)
+    if positive_hits >= 1:
+        return False
+    if negative_hits >= 1:
+        return True
+    # No positive NOR negative signals: DO NOT auto-reject.
+    # Let the profile pass; other filters (coherence, Gemini) can still catch it.
+    # Before this fix, we returned True here, which killed most valid leads.
+    return False
 
 
 def _parse_compact_number(value: str) -> int:
@@ -631,13 +949,32 @@ async def _extract_profile_snapshot(page, username: str) -> dict[str, Any]:
     if "(@" in title_source:
         full_name = title_source.split("(@", 1)[0].strip()
 
+    # Private account detection: multiple signals
+    is_private = False
+    og_desc_lower = og_description.lower()
+    if "privada" in og_desc_lower or "private" in og_desc_lower:
+        is_private = True
+    if not is_private:
+        try:
+            body_text = await page.evaluate(
+                """() => document.body?.innerText?.substring(0, 3000) || ''"""
+            )
+            body_lower = body_text.lower()
+            if "this account is private" in body_lower or "esta cuenta es privada" in body_lower:
+                is_private = True
+        except Exception:
+            pass
+    # If og:description is very short/empty AND posts_count is 0, likely private
+    if not is_private and len(og_description.strip()) < 10 and posts_count == 0:
+        is_private = True
+
     return {
         "username": username,
         "full_name": full_name,
         "biography": og_description,
         "follower_count": followers_count,
         "media_count": posts_count,
-        "is_private": "privada" in og_description.lower() or "private" in og_description.lower(),
+        "is_private": is_private,
     }
 
 
@@ -705,12 +1042,10 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
     seen_links: set[str] = set()
     seen_usernames: set[str] = set()
     max_scrolls = max(8, limit * 4) if target_type == "hashtag" else max(4, limit)
-    extracted_params.setdefault("diagnostics", {"posts_seen": 0, "authors_seen": 0, "profile_errors": 0})
+    extracted_params.setdefault("diagnostics", {"posts_seen": 0, "authors_seen": 0, "profile_errors": 0, "api_authors": 0, "grid_click_authors": 0})
     profile_page = await page.context.new_page()
 
     page_diag = await _collect_hashtag_page_diagnostics(page, query) if target_type == "hashtag" else {}
-    prefer_grid_click = bool(target_type == "hashtag" and page_diag.get("is_search_keyword_url"))
-    desired_post_pool = min(180, max(limit * (15 if prefer_grid_click else 3), 60 if prefer_grid_click else 12))
     if target_type == "hashtag":
         extracted_params.setdefault("diagnostics", {})["page_diag"] = page_diag
         if not bool(page_diag.get("is_hashtag_context")):
@@ -732,16 +1067,44 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
             )
             return
 
+    # ── Phase 1: Capture post-owner usernames via API interception while scrolling ──
+    api_captured_owners: list[dict[str, Any]] = []
+    api_captured_usernames: set[str] = set()
+
+    async def _intercept_hashtag_response(response) -> None:
+        """Capture post owners from Instagram API responses during scrolling."""
+        try:
+            url = response.url
+            if not any(ep in url for ep in ["graphql/query", "api/v1/tags/", "api/v1/media/", "api/v1/feed/", "web_info", "search"]):
+                return
+            if response.request.method == "OPTIONS":
+                return
+            text = await response.text()
+            data = json.loads(text)
+            owners = _extract_post_owners_from_json(data)
+            for owner in owners:
+                un = str(owner.get("username") or "").strip().lower()
+                if un and un != own_username and un not in api_captured_usernames:
+                    api_captured_usernames.add(un)
+                    api_captured_owners.append(owner)
+        except Exception:
+            pass
+
+    # Register the API interceptor
+    page.on("response", lambda resp: asyncio.ensure_future(_intercept_hashtag_response(resp)))
+
+    # Scroll to load posts and trigger API calls
+    desired_post_pool = min(180, max(limit * 6, 30))
     for scroll_index in range(max_scrolls):
         hrefs = await _collect_post_links(page)
-        for href in hrefs[:40]:
+        for href in hrefs[:60]:
             if href and href not in seen_links:
                 seen_links.add(href)
                 post_links.append(href)
 
         extracted_params["diagnostics"]["posts_seen"] = len(post_links)
 
-        if len(post_links) >= desired_post_pool:
+        if len(post_links) >= desired_post_pool or len(api_captured_owners) >= limit * 3:
             break
 
         await page.mouse.wheel(0, random.randint(1800, 3200))
@@ -750,18 +1113,19 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
             "running",
             extracted_params["total"],
             limit,
-            f"Explorando posts de {target_type}:{query} ({len(post_links)} posts detectados)",
+            f"Explorando posts de {target_type}:{query} ({len(post_links)} posts, {len(api_captured_owners)} autores via API)",
             meta={
                 "source": extracted_params["source"],
                 "accepted_count": extracted_params.get("total", 0),
                 "rejected": extracted_params.get("rejected", {}),
                 "posts_seen": len(post_links),
                 "authors_seen": extracted_params["diagnostics"].get("authors_seen", 0),
+                "api_authors_captured": len(api_captured_owners),
                 "profile_errors": extracted_params["diagnostics"].get("profile_errors", 0),
             },
         )
 
-    if not post_links:
+    if not post_links and not api_captured_owners:
         extracted_params.setdefault("rejected", {})["sin_posts_visibles"] = extracted_params.setdefault("rejected", {}).get("sin_posts_visibles", 0) + 1
         latest_diag = await _collect_hashtag_page_diagnostics(page, query) if target_type == "hashtag" else {}
         extracted_params.setdefault("diagnostics", {})["page_diag"] = latest_diag
@@ -782,43 +1146,24 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
         )
         return
 
+    logger.info(f"📡 API interceptor captured {len(api_captured_owners)} unique post owners")
+    extracted_params["diagnostics"]["api_authors"] = len(api_captured_owners)
+
     try:
-        consecutive_post_failures = 0
-        for href in list(post_links):
+        # ── Phase 2a: Process API-captured owners (fast path, no grid clicking needed) ──
+        for owner in api_captured_owners:
             if extracted_params["total"] >= limit:
                 break
 
-            candidate_username = await _extract_author_via_grid_click(page, href, own_username, source_url)
-            if not candidate_username:
-                extracted_params.setdefault("rejected", {})["post_no_legible"] = extracted_params.setdefault("rejected", {}).get("post_no_legible", 0) + 1
-                consecutive_post_failures += 1
-                await asyncio.sleep(_adaptive_cooldown(consecutive_post_failures))
-                if consecutive_post_failures % 5 == 0:
-                    try:
-                        await page.goto(source_url, wait_until="domcontentloaded", timeout=20000)
-                        await asyncio.sleep(2)
-                        await _wait_for_hashtag_grid(page, query, rounds=2)
-                        hrefs = await _collect_post_links(page)
-                        for new_href in hrefs[:60]:
-                            if new_href and new_href not in seen_links:
-                                seen_links.add(new_href)
-                                post_links.append(new_href)
-                        extracted_params["diagnostics"]["posts_seen"] = len(post_links)
-                    except Exception:
-                        pass
-                continue
-
-            if not candidate_username:
-                extracted_params.setdefault("rejected", {})["autor_no_detectado"] = extracted_params.setdefault("rejected", {}).get("autor_no_detectado", 0) + 1
-                consecutive_post_failures += 1
-                await asyncio.sleep(_adaptive_cooldown(consecutive_post_failures))
-                continue
-            consecutive_post_failures = 0
-            if not candidate_username or candidate_username in seen_usernames:
+            candidate_username = str(owner.get("username") or "").strip().lower()
+            if not candidate_username or candidate_username in seen_usernames or candidate_username == own_username:
                 continue
             seen_usernames.add(candidate_username)
             extracted_params["diagnostics"]["authors_seen"] = len(seen_usernames)
 
+            # Always visit profile page for complete bio data.
+            # API owner data often has only username/full_name, missing biography.
+            # Without full bio, niche filters produce false rejections.
             try:
                 profile = await _extract_profile_snapshot(profile_page, candidate_username)
             except Exception:
@@ -838,7 +1183,7 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
                 continue
 
             inserted = db.add_lead(
-                username=profile["username"],
+                username=profile.get("username", candidate_username),
                 full_name=profile.get("full_name", ""),
                 bio=profile.get("biography", ""),
                 source=extracted_params["source"],
@@ -846,17 +1191,18 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
             )
             if inserted:
                 extracted_params["total"] += 1
-                extracted_params.setdefault("accepted", []).append(profile["username"])
+                extracted_params.setdefault("accepted", []).append(candidate_username)
+                logger.info(f"✅ Lead via API [{extracted_params['total']}/{limit}]: @{candidate_username}")
             else:
                 extracted_params.setdefault("rejected", {})["duplicado"] = extracted_params.setdefault("rejected", {}).get("duplicado", 0) + 1
 
-            await asyncio.sleep(random.uniform(1.2, 2.4) if prefer_grid_click else random.uniform(0.6, 1.2))
+            await asyncio.sleep(random.uniform(0.3, 0.8))
 
             update_scraper_status(
                 "running",
                 extracted_params["total"],
                 limit,
-                f"Autores validados desde {target_type}:{query} ({extracted_params['total']}/{limit})",
+                f"Validando autores via API desde {target_type}:{query} ({extracted_params['total']}/{limit})",
                 meta={
                     "source": extracted_params["source"],
                     "accepted_count": extracted_params.get("total", 0),
@@ -864,9 +1210,69 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
                     "rejected": extracted_params.get("rejected", {}),
                     "posts_seen": len(post_links),
                     "authors_seen": extracted_params["diagnostics"].get("authors_seen", 0),
+                    "api_authors_captured": len(api_captured_owners),
                     "profile_errors": extracted_params["diagnostics"].get("profile_errors", 0),
                 },
             )
+
+        # ── Phase 2b: Grid-click fallback for remaining posts if limit not reached ──
+        if extracted_params["total"] < limit and post_links:
+            logger.info(f"🖱️ Grid-click fallback: need {limit - extracted_params['total']} more leads, trying {len(post_links)} posts")
+            consecutive_post_failures = 0
+            for href in list(post_links):
+                if extracted_params["total"] >= limit:
+                    break
+
+                candidate_username = await _extract_author_via_grid_click(page, href, own_username, source_url)
+                if not candidate_username:
+                    extracted_params.setdefault("rejected", {})["post_no_legible"] = extracted_params.setdefault("rejected", {}).get("post_no_legible", 0) + 1
+                    consecutive_post_failures += 1
+                    await asyncio.sleep(_adaptive_cooldown(consecutive_post_failures))
+                    if consecutive_post_failures >= 10:
+                        logger.info("Grid click fallback: too many failures, stopping")
+                        break
+                    continue
+
+                consecutive_post_failures = 0
+                if candidate_username in seen_usernames:
+                    continue
+                seen_usernames.add(candidate_username)
+                extracted_params["diagnostics"]["authors_seen"] = len(seen_usernames)
+                extracted_params["diagnostics"]["grid_click_authors"] = extracted_params["diagnostics"].get("grid_click_authors", 0) + 1
+
+                try:
+                    profile = await _extract_profile_snapshot(profile_page, candidate_username)
+                except Exception:
+                    extracted_params["diagnostics"]["profile_errors"] = extracted_params["diagnostics"].get("profile_errors", 0) + 1
+                    extracted_params.setdefault("rejected", {})["perfil_no_legible"] = extracted_params.setdefault("rejected", {}).get("perfil_no_legible", 0) + 1
+                    continue
+
+                is_valid, reason = _is_valid_lead(
+                    profile,
+                    own_username,
+                    target_type,
+                    query,
+                    extracted_params.get("filters", {}),
+                )
+                if not is_valid:
+                    extracted_params.setdefault("rejected", {})[reason] = extracted_params.setdefault("rejected", {}).get(reason, 0) + 1
+                    continue
+
+                inserted = db.add_lead(
+                    username=profile["username"],
+                    full_name=profile.get("full_name", ""),
+                    bio=profile.get("biography", ""),
+                    source=extracted_params["source"],
+                    campaign_id=extracted_params.get("campaign_id", ""),
+                )
+                if inserted:
+                    extracted_params["total"] += 1
+                    extracted_params.setdefault("accepted", []).append(profile["username"])
+                    logger.info(f"✅ Lead via grid [{extracted_params['total']}/{limit}]: @{candidate_username}")
+                else:
+                    extracted_params.setdefault("rejected", {})["duplicado"] = extracted_params.setdefault("rejected", {}).get("duplicado", 0) + 1
+
+                await asyncio.sleep(random.uniform(1.0, 2.0))
     finally:
         await profile_page.close()
 
@@ -898,7 +1304,8 @@ def _is_valid_lead(user: dict[str, Any], own_username: str, source_type: str, so
         ("edge_owner_to_timeline_media", "count"),
     )
 
-    source_tokens = _source_tokens(source_value)
+    source_domain_tokens, source_geo_tokens = _source_tokens_split(source_value)
+    source_tokens = source_domain_tokens + source_geo_tokens
     has_keyword = any(kw in bio for kw in TARGET_KEYWORDS)
     source_match = any(token in bio or token in full_name_norm or token in username_norm for token in source_tokens)
     profile_text = " ".join([bio, full_name_norm, username_norm])
@@ -927,6 +1334,16 @@ def _is_valid_lead(user: dict[str, Any], own_username: str, source_type: str, so
     require_keyword_match = bool(filters.get("require_keyword_match", False))
     require_coherence = bool(filters.get("require_coherence", True))
     followers_mode = str(filters.get("followers_mode") or "strict")
+    include_terms, exclude_terms = _strategy_context_terms(filters)
+    positive_context_hits = _count_term_hits(profile_text, include_terms)
+    negative_context_hits = _count_term_hits(profile_text, exclude_terms)
+    # CRITICAL: use ONLY domain tokens for niche checks, not geo tokens.
+    # Geo tokens ("buenos aires") match any account from that city.
+    # Domain tokens ("constructora", "construccion") indicate actual niche relevance.
+    domain_hits = _count_term_hits(profile_text, source_domain_tokens)
+    all_source_hits = _count_term_hits(profile_text, source_tokens)
+
+    source_match = source_match or positive_context_hits > 0 or all_source_hits > 0
 
     if source_type in {"hashtag", "location"}:
         if followers < min_followers:
@@ -935,7 +1352,18 @@ def _is_valid_lead(user: dict[str, Any], own_username: str, source_type: str, so
             return False, "baja_actividad"
         if require_identity and not has_identity:
             return False, "sin_identidad"
-        if require_coherence and _coherence_mismatch(profile_text, source_tokens, has_keyword, source_match):
+        if include_terms:
+            if positive_context_hits <= 0 and domain_hits <= 0:
+                gemini_decision = _gemini_niche_decision(user, filters, source_value)
+                if gemini_decision is not None and not gemini_decision[0]:
+                    return False, "perfil_fuera_nicho"
+                # If Gemini is unavailable (None), ACCEPT — better false positive than losing leads
+            if negative_context_hits > positive_context_hits and domain_hits <= 0:
+                gemini_decision = _gemini_niche_decision(user, filters, source_value)
+                if gemini_decision is not None and not gemini_decision[0]:
+                    return False, "perfil_fuera_nicho"
+                # If Gemini is unavailable (None), ACCEPT
+        if require_coherence and _coherence_mismatch(profile_text, source_domain_tokens, has_keyword, bool(domain_hits > 0)):
             return False, "perfil_fuera_nicho"
         return True, "ok"
 

@@ -5,21 +5,26 @@ Gestiona la persistencia local de leads y campañas (SQLite).
 Provee una interfaz limpia para que los scrapers inserten y
 los messengers consuman.
 
-Ruta: database/primebot.db
+Ruta: database/botardium.db
 """
 
+import os
 import sqlite3
 import logging
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
 
-logger = logging.getLogger("primebot.db")
+logger = logging.getLogger("botardium.db")
 
 # Paths
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DB_DIR = PROJECT_ROOT / "database"
-DB_PATH = DB_DIR / "primebot.db"
+LEGACY_DB_PATH = DB_DIR / "primebot.db"
+DB_PATH = DB_DIR / "botardium.db"
+
+if LEGACY_DB_PATH.exists() and not DB_PATH.exists():
+    LEGACY_DB_PATH.replace(DB_PATH)
 
 
 class DatabaseManager:
@@ -27,6 +32,7 @@ class DatabaseManager:
 
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
+        self.workspace_id = int(os.getenv("BOTARDIUM_WORKSPACE_ID") or "0") or None
         self._ensure_dir()
         self.init_db()
 
@@ -86,6 +92,8 @@ class DatabaseManager:
                 cursor.execute("ALTER TABLE leads ADD COLUMN last_outreach_error TEXT")
             if "last_message_rationale" not in columns:
                 cursor.execute("ALTER TABLE leads ADD COLUMN last_message_rationale TEXT")
+            if "workspace_id" not in columns:
+                cursor.execute("ALTER TABLE leads ADD COLUMN workspace_id INTEGER")
             
             # Índices para búsquedas rápidas
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status)')
@@ -93,7 +101,7 @@ class DatabaseManager:
             conn.commit()
             logger.debug("Base de datos inicializada correctamente.")
 
-    def add_lead(self, username: str, full_name: str = "", bio: str = "", source: str = "", campaign_id: str = "") -> bool:
+    def add_lead(self, username: str, full_name: str = "", bio: str = "", source: str = "", campaign_id: str = "", workspace_id: Optional[int] = None) -> bool:
         """
         Agrega un nuevo lead a la base de datos si no existe.
         
@@ -107,17 +115,24 @@ class DatabaseManager:
             True si se insertó, False si ya existía.
         """
         try:
+            active_workspace_id = workspace_id or self.workspace_id
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                if active_workspace_id:
+                    cursor.execute(
+                        "SELECT id FROM leads WHERE workspace_id = ? AND lower(ig_username) = lower(?) LIMIT 1",
+                        (active_workspace_id, username),
+                    )
+                else:
+                    cursor.execute("SELECT id FROM leads WHERE lower(ig_username) = lower(?) LIMIT 1", (username,))
+                if cursor.fetchone():
+                    return False
                 cursor.execute('''
-                    INSERT INTO leads (ig_username, full_name, bio, campaign_id, source, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, 'Pendiente', ?)
-                ''', (username, full_name, bio, campaign_id, source, datetime.now().isoformat()))
+                    INSERT INTO leads (ig_username, full_name, bio, campaign_id, source, status, created_at, workspace_id)
+                    VALUES (?, ?, ?, ?, ?, 'Pendiente', ?, ?)
+                ''', (username, full_name, bio, campaign_id, source, datetime.now().isoformat(), active_workspace_id))
                 conn.commit()
                 return True
-        except sqlite3.IntegrityError:
-            # El lead ya existe (username UNIQUE)
-            return False
         except Exception as e:
             logger.error(f"Error insertando lead @{username}: {e}")
             return False
@@ -149,24 +164,26 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 if ids:
                     placeholders = ",".join("?" for _ in ids)
+                    workspace_clause = " AND workspace_id = ?" if self.workspace_id else ""
                     cursor.execute(
                         f'''
                         SELECT * FROM leads
-                        WHERE id IN ({placeholders}) AND status IN ({','.join('?' for _ in valid_statuses)})
+                        WHERE id IN ({placeholders}) AND status IN ({','.join('?' for _ in valid_statuses)}){workspace_clause}
                         ORDER BY created_at ASC
                         LIMIT ?
                         ''',
-                        [*ids, *valid_statuses, limit],
+                        [*ids, *valid_statuses, *([self.workspace_id] if self.workspace_id else []), limit],
                     )
                 else:
+                    workspace_clause = " AND workspace_id = ?" if self.workspace_id else ""
                     cursor.execute(
                         f'''
                         SELECT * FROM leads
-                        WHERE status IN ({','.join('?' for _ in valid_statuses)})
+                        WHERE status IN ({','.join('?' for _ in valid_statuses)}){workspace_clause}
                         ORDER BY created_at ASC
                         LIMIT ?
                         ''',
-                        [*valid_statuses, limit],
+                        [*valid_statuses, *([self.workspace_id] if self.workspace_id else []), limit],
                     )
                 rows = cursor.fetchall()
                 return [dict(row) for row in rows]
@@ -220,9 +237,9 @@ class DatabaseManager:
                         message_variant = COALESCE(?, message_variant),
                         last_outreach_result = COALESCE(?, last_outreach_result),
                         last_outreach_error = ?
-                    WHERE ig_username = ?
+                    WHERE ig_username = ? AND (? IS NULL OR workspace_id = ?)
                     ''',
-                    (new_status, datetime.now().isoformat(), sent_at, follow_up_due_at, message_variant, result, error_detail, username),
+                    (new_status, datetime.now().isoformat(), sent_at, follow_up_due_at, message_variant, result, error_detail, username, self.workspace_id, self.workspace_id),
                 )
                 conn.commit()
         except Exception as e:

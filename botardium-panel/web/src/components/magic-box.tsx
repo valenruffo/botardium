@@ -4,6 +4,7 @@ import React, { useState } from 'react'
 import { Search, Sparkles, Target, ArrowRight } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { toast } from 'sonner'
+import { apiUrl } from '@/lib/api'
 
 type StrategyResult = {
     sources: Array<{
@@ -11,6 +12,11 @@ type StrategyResult = {
         target: string
     }>
     reasoning: string
+    filter_context?: {
+        intent_summary?: string
+        include_terms?: string[]
+        exclude_terms?: string[]
+    }
 }
 
 const typeLabel: Record<StrategyResult['sources'][number]['type'], string> = {
@@ -19,27 +25,45 @@ const typeLabel: Record<StrategyResult['sources'][number]['type'], string> = {
     location: 'Mercado geografico',
 }
 
-export function MagicBox({ onStrategyApplied }: { onStrategyApplied: (data: StrategyResult) => void }) {
+export function MagicBox({
+    onStrategyApplied,
+    workspaceId,
+    disabled = false,
+    disabledReason,
+    onRequireSetup,
+}: {
+    onStrategyApplied: (data: StrategyResult) => void
+    workspaceId?: number | null
+    disabled?: boolean
+    disabledReason?: string
+    onRequireSetup?: () => void
+}) {
     const [prompt, setPrompt] = useState("")
     const [isLoading, setIsLoading] = useState(false)
     const [result, setResult] = useState<StrategyResult | null>(null)
 
     const handleMagicSearch = async (e: React.FormEvent) => {
         e.preventDefault()
-        if (!prompt) return
+        if (disabled) {
+            toast.error(disabledReason || 'Necesitas configurar API keys para usar Magic Box.')
+            onRequireSetup?.()
+            return
+        }
+        if (!prompt || !workspaceId) return
 
         setIsLoading(true)
         try {
             // LLamada a FastAPI Backend
-            const res = await fetch("http://localhost:8000/api/ai/strategy", {
+            const res = await fetch(apiUrl('/api/ai/strategy'), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ prompt })
+                body: JSON.stringify({ prompt, workspace_id: workspaceId })
             })
 
             const data = await res.json()
             if (!res.ok) {
                 toast.error(data.detail || 'La IA no pudo generar una ruta valida.')
+                if (res.status === 412) onRequireSetup?.()
                 return
             }
 
@@ -79,12 +103,14 @@ export function MagicBox({ onStrategyApplied }: { onStrategyApplied: (data: Stra
                             className="w-full bg-transparent border-0 outline-none focus:outline-none focus:ring-0 focus:border-transparent text-slate-100 placeholder:text-slate-500 text-base md:text-lg px-2"
                             value={prompt}
                             onChange={(e) => setPrompt(e.target.value)}
-                            disabled={isLoading}
+                            disabled={isLoading || disabled}
                         />
                         <button
                             type="submit"
                             disabled={isLoading || !prompt}
-                            className="bg-purple-600 hover:bg-purple-500 text-white px-5 lg:px-6 py-2 rounded-xl font-medium transition-colors disabled:opacity-50 flex items-center justify-center gap-2 whitespace-nowrap flex-shrink-0 min-w-[140px]"
+                            onClick={disabled ? (e) => { e.preventDefault(); onRequireSetup?.(); } : undefined}
+                            title={disabled ? (disabledReason || 'Necesitas API keys para usar Magic Box.') : undefined}
+                            className={`px-5 lg:px-6 py-2 rounded-xl font-medium transition-colors flex items-center justify-center gap-2 whitespace-nowrap flex-shrink-0 min-w-[140px] ${disabled ? 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20' : 'bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-50'}`}
                         >
                             {isLoading ? (
                                 <div className="flex items-center gap-1.5">
@@ -101,6 +127,11 @@ export function MagicBox({ onStrategyApplied }: { onStrategyApplied: (data: Stra
                         </button>
                     </form>
                 </div>
+                {disabled && (
+                    <div className="border-t border-rose-500/20 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+                        {disabledReason || 'Necesitas API keys para usar Magic Box.'}
+                    </div>
+                )}
 
                 {/* AI Result Area */}
                 <AnimatePresence>
@@ -123,9 +154,10 @@ export function MagicBox({ onStrategyApplied }: { onStrategyApplied: (data: Stra
                                     </p>
                                     <div className="flex flex-wrap gap-4 mt-4">
                                         {result.sources.filter((source) => source.type === 'hashtag').map((source, index) => (
-                                            <div key={`${source.type}-${source.target}-${index}`} className="bg-slate-900 px-4 py-2 rounded-lg border border-slate-700 flex flex-col">
+                                            <div key={`${source.type}-${source.target}-${index}`} className={`px-4 py-2 rounded-lg border flex flex-col ${index === 0 ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-slate-900 border-slate-700'}`}>
                                                 <span className="text-xs text-slate-500 uppercase">{typeLabel[source.type]}</span>
                                                 <span className="font-medium text-slate-200">{source.type === 'hashtag' ? '#' : source.type === 'followers' ? '@' : ''}{source.target}</span>
+                                                {index === 0 ? <span className="mt-1 text-[10px] font-semibold uppercase tracking-wide text-cyan-300">Principal</span> : null}
                                             </div>
                                         ))}
                                     </div>

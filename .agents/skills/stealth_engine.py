@@ -9,6 +9,7 @@ Consulta: directivas/memoria_maestra.md § 4 (Reglas de IP y Fingerprint)
 """
 
 import asyncio
+import os
 import random
 import logging
 import subprocess
@@ -18,6 +19,15 @@ from typing import Any, Optional, cast
 from pathlib import Path
 
 logger = logging.getLogger("primebot.stealth")
+
+WINDOWS_BROWSER_CANDIDATES = [
+    ("msedge", None),
+    ("chrome", None),
+    (None, r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    (None, r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+    (None, r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+    (None, r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+]
 
 
 @dataclass
@@ -91,6 +101,48 @@ async def _install_patchright_chromium() -> None:
     )
 
 
+async def _launch_chromium_with_fallback(playwright: Any, launch_kwargs: dict[str, Any]):
+    try:
+        return await playwright.chromium.launch(**launch_kwargs)
+    except Exception as exc:
+        message = str(exc)
+        if not _is_missing_browser_error(message):
+            raise
+
+        logger.warning("Patchright Chromium no esta disponible. Intentando fallback con navegador instalado...")
+        fallback_errors: list[str] = []
+        for channel, executable_path in WINDOWS_BROWSER_CANDIDATES:
+            extra_kwargs = dict(launch_kwargs)
+            label = channel or executable_path or "unknown-browser"
+            if executable_path:
+                if not Path(executable_path).exists():
+                    continue
+                extra_kwargs["executable_path"] = executable_path
+            elif channel:
+                extra_kwargs["channel"] = channel
+            try:
+                logger.info(f"Intentando navegador fallback: {label}")
+                return await playwright.chromium.launch(**extra_kwargs)
+            except Exception as fallback_exc:
+                fallback_errors.append(f"{label}: {fallback_exc}")
+
+        if getattr(sys, "frozen", False):
+            raise RuntimeError(
+                "Botardium no encontro un navegador Chromium utilizable para iniciar sesion. "
+                "Instala Microsoft Edge o Google Chrome en esta PC."
+            ) from exc
+
+        try:
+            await _install_patchright_chromium()
+            return await playwright.chromium.launch(**launch_kwargs)
+        except Exception as install_exc:
+            details = "; ".join(fallback_errors[:3])
+            raise RuntimeError(
+                "Patchright no encontro Chromium y el fallback con navegadores instalados tambien fallo. "
+                f"Detalles: {details or install_exc}"
+            ) from install_exc
+
+
 async def create_stealth_browser(
     proxy: Optional[str] = None,
     headless: bool = False,
@@ -132,22 +184,10 @@ async def create_stealth_browser(
         logger.info(f"   Proxy: {proxy[:30]}...")
 
     try:
-        browser = await pw.chromium.launch(**launch_kwargs)
+        browser = await _launch_chromium_with_fallback(pw, launch_kwargs)
     except Exception as exc:
-        message = str(exc)
         await pw.stop()
-
-        if _is_missing_browser_error(message):
-            try:
-                await _install_patchright_chromium()
-                pw = await async_playwright().start()
-                browser = await pw.chromium.launch(**launch_kwargs)
-            except Exception as install_exc:
-                raise RuntimeError(
-                    "Patchright no encontro Chromium y la instalacion automatica fallo. Ejecuta `python -m patchright install chromium`."
-                ) from install_exc
-        else:
-            raise RuntimeError(f"No se pudo iniciar Patchright Chromium: {message}") from exc
+        raise RuntimeError(f"No se pudo iniciar Patchright Chromium: {exc}") from exc
 
     viewport = _randomize_viewport(random.choice(VIEWPORTS))
     user_agent = _pick_user_agent()

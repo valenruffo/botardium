@@ -18,12 +18,10 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from scripts.runtime_paths import ENV_EXAMPLE_PATH, ENV_PATH, MEMORIA_PATH, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
-MEMORIA_PATH = PROJECT_ROOT / "directivas" / "memoria_maestra.md"
+PROJECT_ROOT = SOURCE_ROOT
 
 # Logging
 logging.basicConfig(
@@ -34,7 +32,10 @@ logging.basicConfig(
 logger = logging.getLogger("primebot.onboarding")
 
 # Load .env
-load_dotenv(PROJECT_ROOT / ".env")
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv(ENV_EXAMPLE_PATH)
 
 
 # --------------------------------------------------------------------------- #

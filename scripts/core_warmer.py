@@ -24,12 +24,10 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
+from scripts.runtime_paths import AGENTS_DIR, ENV_EXAMPLE_PATH, ENV_PATH, MEMORIA_PATH, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
-MEMORIA_PATH = PROJECT_ROOT / "directivas" / "memoria_maestra.md"
+PROJECT_ROOT = SOURCE_ROOT
 
 # Logging
 logging.basicConfig(
@@ -40,13 +38,16 @@ logging.basicConfig(
 logger = logging.getLogger("primebot.warmer")
 
 # Load .env
-load_dotenv(PROJECT_ROOT / ".env")
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv(ENV_EXAMPLE_PATH)
 
 # Ensure project imports (scripts.*) resolve when executed as script
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Add .agents to path
-sys.path.insert(0, str(PROJECT_ROOT / ".agents"))
+sys.path.insert(0, str(AGENTS_DIR))
 
 IG_BASE = "https://www.instagram.com/"
 
@@ -75,38 +76,6 @@ Uso:
     python scripts/core_warmer.py --dry-run      # Test corto de 2 min
     python scripts/core_warmer.py --duration 15  # Override duración (minutos)
 """
-
-import asyncio
-import json
-import os
-import sys
-import argparse
-import random
-import time
-import logging
-from pathlib import Path
-from datetime import datetime
-from dotenv import load_dotenv
-
-# Paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-TMP_DIR = PROJECT_ROOT / ".tmp"
-PROFILE_PATH = TMP_DIR / "account_profile.json"
-MEMORIA_PATH = PROJECT_ROOT / "directivas" / "memoria_maestra.md"
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("primebot.warmer")
-
-# Load .env
-load_dotenv(PROJECT_ROOT / ".env")
-
-# Add .agents to path
-sys.path.insert(0, str(PROJECT_ROOT / ".agents"))
 
 IG_BASE = "https://www.instagram.com/"
 
