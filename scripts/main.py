@@ -68,7 +68,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": _current_app_version()}
 
 app.add_middleware(
     CORSMiddleware,

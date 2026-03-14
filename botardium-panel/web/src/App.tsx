@@ -6,7 +6,7 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MagicBox } from "@/components/magic-box";
 import { apiUrl } from "@/lib/api";
-import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, BadgeCheck, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles } from "lucide-react";
+import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck } from "lucide-react";
 
 declare const __APP_VERSION__: string;
 import { Badge } from "@/components/ui/badge";
@@ -1828,13 +1828,13 @@ export default function Dashboard() {
                   onClick={() => { setCurrentView('campaigns'); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl font-medium transition-colors cursor-pointer text-left ${currentView === 'campaigns' ? 'bg-purple-500/10 text-purple-400' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'}`}
                 >
-                  <MessageSquare className="w-4 h-4" /> Campañas
+                  <FolderKanban className="w-4 h-4" /> Campañas
                 </button>
                 <button
                   onClick={() => { setCurrentView('message_studio'); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl font-medium transition-colors cursor-pointer text-left ${currentView === 'message_studio' ? 'bg-purple-500/10 text-purple-400' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'}`}
                 >
-                  <BadgeCheck className="w-4 h-4" /> Message Studio
+                  <Sparkles className="w-4 h-4" /> Message Studio
                 </button>
               </nav>
             </div>

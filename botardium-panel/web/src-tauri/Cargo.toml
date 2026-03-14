@@ -1,6 +1,6 @@
 [package]
 name = "botardium-desktop"
-version = "1.0.1"
+version = "1.0.2"
 description = "Botardium desktop shell for Windows"
 authors = ["Botardium"]
 license = "Proprietary"
