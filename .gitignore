@@ -5,6 +5,7 @@
 
 # === Datos Intermedios ===
 .tmp/
+.atl/
 .agents/sessions/
 database/*.db
 *.spec
