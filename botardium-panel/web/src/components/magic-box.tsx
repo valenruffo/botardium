@@ -90,7 +90,7 @@ export function MagicBox({
     }
 
     return (
-        <div className="w-full max-w-3xl mx-auto my-8">
+        <div className="my-8 w-full max-w-3xl">
             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl transition-all duration-300">
 
                 {/* Input Area */}

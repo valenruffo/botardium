@@ -60,15 +60,30 @@ export const clearStoredSession = () => {
   window.localStorage.removeItem(AUTH_STORAGE_KEY);
 };
 
-export const apiFetch = (input: string, init?: RequestInit) => {
+export const apiFetch = async (input: string, init?: RequestInit): Promise<Response> => {
   const session = getStoredSession();
   const headers = new Headers(init?.headers ?? {});
   if (session?.token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${session.token}`);
   }
   const target = /^https?:\/\//i.test(input) ? input : apiUrl(input);
-  return fetch(target, {
-    ...init,
-    headers,
-  });
+  
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  
+  try {
+    const response = await fetch(target, {
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    return response;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('La solicitud tardó demasiado tiempo');
+    }
+    throw error;
+  }
 };

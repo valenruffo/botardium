@@ -2522,6 +2522,41 @@ async def create_workspace(req: WorkspaceCreateReq):
     }
 
 
+@app.delete("/api/workspaces/{workspace_id}")
+async def delete_workspace(workspace_id: int):
+    """Elimina un workspace y todos sus datos (cuentas, leads, etc)."""
+    conn = _connect_db()
+    cursor = conn.cursor()
+    
+    # Verificar que existe
+    cursor.execute("SELECT workspace_name FROM users WHERE id = ?", (workspace_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    
+    workspace_name = row[0]
+    
+    # Verificar que no sea el último workspace
+    cursor.execute("SELECT COUNT(*) FROM users WHERE is_workspace = 1")
+    count = cursor.fetchone()[0]
+    if count <= 1:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No puedes eliminar el último workspace.")
+    
+    # Eliminar en orden inverso a las dependencias
+    cursor.execute("DELETE FROM leads WHERE workspace_id = ?", (workspace_id,))
+    cursor.execute("DELETE FROM campaigns_cache WHERE workspace_id = ?", (workspace_id,))
+    cursor.execute("DELETE FROM message_jobs_cache WHERE workspace_id = ?", (workspace_id,))
+    cursor.execute("DELETE FROM ig_accounts WHERE user_id = ?", (workspace_id,))
+    cursor.execute("DELETE FROM users WHERE id = ?", (workspace_id,))
+    
+    conn.commit()
+    conn.close()
+    
+    return {"ok": True, "deleted": workspace_name}
+
+
 @app.post("/api/workspaces/{workspace_id}/export")
 async def export_workspace(workspace_id: int, request: Request):
     actor = _authorize_workspace_scope(

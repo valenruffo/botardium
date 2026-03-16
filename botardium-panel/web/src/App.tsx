@@ -6,7 +6,7 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MagicBox } from "@/components/magic-box";
 import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
-import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck } from "lucide-react";
+import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2 } from "lucide-react";
 
 declare const __APP_VERSION__: string;
 import { Badge } from "@/components/ui/badge";
@@ -17,6 +17,10 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuPortal,
 } from "@/components/ui/dropdown-menu";
 
 const fetcher = async (url: string) => {
@@ -472,6 +476,126 @@ type Workspace = {
   slug: string;
 };
 
+// Ordenar workspaces: el actual primero, luego por nombre
+const sortWorkspaces = (workspaces: Workspace[], currentId?: number | null): Workspace[] => {
+  return [...workspaces].sort((a, b) => {
+    if (a.id === currentId) return -1;
+    if (b.id === currentId) return 1;
+    return a.name.localeCompare(b.name);
+  });
+};
+
+type WorkspaceDeleteButtonProps = {
+  workspaceId: number;
+  workspaceName: string;
+  onDeleted: () => Promise<boolean>;
+  disabled?: boolean;
+};
+
+function WorkspaceDeleteButton({ workspaceId, workspaceName, onDeleted, disabled }: WorkspaceDeleteButtonProps) {
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const deleteAttemptRef = useRef(0);
+  
+  useEffect(() => {
+    if (confirming && !deleting) {
+      const timer = setTimeout(() => setConfirming(false), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [confirming, deleting]);
+  
+  const handleDelete = async () => {
+    if (disabled || deleting) return;
+
+    if (!confirming) {
+      setConfirming(true);
+      return;
+    }
+    
+    const attemptId = ++deleteAttemptRef.current;
+    setDeleting(true);
+    
+    try {
+      console.log(`[WorkspaceDelete] Attempt ${attemptId}: Starting delete for workspace ${workspaceId}`);
+      
+      const res = await apiFetch(apiUrl(`/api/workspaces/${workspaceId}`), { 
+        method: 'DELETE',
+      });
+      
+      console.log(`[WorkspaceDelete] Attempt ${attemptId}: Response status ${res.status}`);
+      
+      if (attemptId !== deleteAttemptRef.current) {
+        console.log(`[WorkspaceDelete] Attempt ${attemptId}: Cancelled by newer attempt`);
+        return;
+      }
+      
+      if (res.ok) {
+        console.log(`[WorkspaceDelete] Attempt ${attemptId}: Success response`);
+        const removed = await onDeleted();
+        if (removed) {
+          toast.success(`Workspace "${workspaceName}" eliminado.`);
+        } else {
+          toast.error('El workspace no se reflejo en la UI. Reintentando sincronizar...');
+        }
+      } else {
+        const data = await res.json();
+        const errMsg = data.detail || `Error ${res.status}: No pude eliminar el workspace`;
+        console.error(`[WorkspaceDelete] Attempt ${attemptId}: Error -`, errMsg);
+        toast.error(errMsg);
+        setConfirming(false);
+      }
+    } catch (err) {
+      if (attemptId !== deleteAttemptRef.current) {
+        console.log(`[WorkspaceDelete] Attempt ${attemptId}: Cancelled by newer attempt`);
+        return;
+      }
+
+      const msg = err instanceof Error ? err.message : 'Error de conexión';
+      console.error(`[WorkspaceDelete] Attempt ${attemptId}: Exception -`, msg);
+
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const removed = await onDeleted();
+      if (removed) {
+        toast.success(`Workspace "${workspaceName}" eliminado.`);
+      } else {
+        toast.error(msg);
+      }
+      setConfirming(false);
+    }
+    setDeleting(false);
+  };
+  
+  const isDisabled = disabled || deleting;
+  
+  return (
+    <button
+      type="button"
+      onClick={handleDelete}
+      onBlur={() => !deleting && setConfirming(false)}
+      disabled={isDisabled}
+      className={`opacity-0 group-hover:opacity-100 p-2 rounded-lg transition-all ${
+        isDisabled
+          ? 'opacity-100 bg-slate-600 cursor-wait'
+          : confirming 
+            ? 'opacity-100 bg-rose-500 text-white hover:bg-rose-600' 
+            : 'text-rose-400 hover:bg-rose-500/20'
+      }`}
+      title={deleting ? 'Eliminando...' : confirming ? 'Clickeá de nuevo para confirmar' : 'Eliminar workspace'}
+    >
+      {deleting ? (
+        <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+      ) : confirming ? (
+        <Check className="w-4 h-4" />
+      ) : (
+        <Trash2 className="w-4 h-4" />
+      )}
+    </button>
+  );
+}
+
 type AiSettingsStatus = {
   google_api_key: string;
   openai_api_key: string;
@@ -550,6 +674,9 @@ export default function Dashboard() {
   const [isReloggingAccount, setIsReloggingAccount] = useState(false);
   const [messageStatuses, setMessageStatuses] = useState<Array<'Pendiente' | 'Listo para contactar' | 'Primer contacto' | 'Follow-up 1' | 'Follow-up 2'>>(['Pendiente', 'Listo para contactar', 'Primer contacto', 'Follow-up 1', 'Follow-up 2']);
   const [messageScopeCampaign, setMessageScopeCampaign] = useState<string>('');
+  const [campaignDeleteConfirming, setCampaignDeleteConfirming] = useState<Record<string, boolean>>({});
+  const [campaignDeleteLoading, setCampaignDeleteLoading] = useState<Record<string, boolean>>({});
+  const campaignDeleteConfirmTimeouts = useRef<Record<string, number>>({});
   const openHowTo = () => {
     setCurrentRoute('app');
     setCurrentView('guide');
@@ -557,6 +684,48 @@ export default function Dashboard() {
   const openApiKeys = () => {
     setCurrentRoute('app');
     setCurrentView('api_keys');
+  };
+
+  useEffect(() => {
+    return () => {
+      Object.values(campaignDeleteConfirmTimeouts.current).forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    };
+  }, []);
+
+  const clearCampaignDeleteConfirm = (campaignId: string) => {
+    const existingTimeout = campaignDeleteConfirmTimeouts.current[campaignId];
+    if (existingTimeout) {
+      window.clearTimeout(existingTimeout);
+      delete campaignDeleteConfirmTimeouts.current[campaignId];
+    }
+    setCampaignDeleteConfirming((prev) => {
+      if (!prev[campaignId]) return prev;
+      const next = { ...prev };
+      delete next[campaignId];
+      return next;
+    });
+  };
+
+  const armCampaignDeleteConfirm = (campaignId: string) => {
+    clearCampaignDeleteConfirm(campaignId);
+    setCampaignDeleteConfirming((prev) => ({ ...prev, [campaignId]: true }));
+    campaignDeleteConfirmTimeouts.current[campaignId] = window.setTimeout(() => {
+      setCampaignDeleteConfirming((prev) => {
+        if (!prev[campaignId]) return prev;
+        const next = { ...prev };
+        delete next[campaignId];
+        return next;
+      });
+      delete campaignDeleteConfirmTimeouts.current[campaignId];
+    }, 3200);
+  };
+
+  const syncCampaignDeletion = async (campaignId: string): Promise<boolean> => {
+    const updated = await mutateBotStatus();
+    const latestCampaigns = updated?.campaigns || [];
+    return !latestCampaigns.some((campaign) => campaign.id === campaignId);
   };
   const applySession = (session: StoredSession) => {
     setStoredSession(session);
@@ -990,7 +1159,7 @@ export default function Dashboard() {
 
 
 
-  const campaignAction = async (campaignId: string, action: 'start_warmup' | 'finish_warmup' | 'start_scraping' | 'pause' | 'delete') => {
+  const campaignAction = async (campaignId: string, action: 'start_warmup' | 'finish_warmup' | 'start_scraping' | 'pause') => {
     try {
       const res = await apiFetch(apiUrl(`/api/bot/${campaignId}/action`), {
         method: 'POST',
@@ -1003,11 +1172,55 @@ export default function Dashboard() {
         return;
       }
       await mutateBotStatus();
-      if (action === 'delete') {
-        toast.info('Campana eliminada del panel.');
-      }
     } catch {
       toast.error('Error conectando con el estado de campanas.');
+    }
+  };
+
+  const handleCampaignDelete = async (campaignId: string, campaignName: string) => {
+    if (campaignDeleteLoading[campaignId]) return;
+    if (!campaignDeleteConfirming[campaignId]) {
+      armCampaignDeleteConfirm(campaignId);
+      return;
+    }
+
+    clearCampaignDeleteConfirm(campaignId);
+    setCampaignDeleteLoading((prev) => ({ ...prev, [campaignId]: true }));
+
+    try {
+      const res = await apiFetch(apiUrl(`/api/bot/${campaignId}/action`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete' }),
+      });
+
+      if (res.ok) {
+        const removed = await syncCampaignDeletion(campaignId);
+        if (removed) {
+          toast.success(`Campana "${campaignName}" eliminada.`);
+        } else {
+          toast.error('La campana no se actualizo en pantalla. Reintentando sincronizar...');
+        }
+      } else {
+        const data = await res.json().catch(() => ({}));
+        toast.error(data.detail || 'No pude eliminar la campana.');
+      }
+    } catch (error) {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const removed = await syncCampaignDeletion(campaignId);
+      if (removed) {
+        toast.success(`Campana "${campaignName}" eliminada.`);
+      } else {
+        const message = error instanceof Error ? error.message : 'Error conectando con el estado de campanas.';
+        toast.error(message);
+      }
+    } finally {
+      setCampaignDeleteLoading((prev) => {
+        if (!prev[campaignId]) return prev;
+        const next = { ...prev };
+        delete next[campaignId];
+        return next;
+      });
     }
   };
 
@@ -1513,7 +1726,7 @@ export default function Dashboard() {
   };
 
   if (currentRoute === 'auth' || currentRoute === 'register') {
-    const workspaces = workspacesData?.workspaces || [];
+    const workspaces = sortWorkspaces(workspacesData?.workspaces || [], currentUserId);
     return (
       <main className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
         <div className="w-full max-w-2xl bg-slate-900/80 backdrop-blur-xl border border-slate-800 rounded-3xl p-8 shadow-2xl relative overflow-hidden animate-in fade-in zoom-in-95">
@@ -1528,23 +1741,38 @@ export default function Dashboard() {
           <div className="grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
             <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-5">
               <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-slate-500">Abrir workspace existente</p>
-              <div className="space-y-3">
+              <div className="space-y-3 overflow-y-auto max-h-[300px] pr-2" style={{ scrollbarWidth: 'thin', scrollbarColor: '#475569 #0f172a' }}>
                 {workspaces.length === 0 && <p className="text-sm text-slate-500">Todavía no hay workspaces creados en esta PC.</p>}
                 {workspaces.map((workspace) => (
-                  <button
+                  <div
                     key={workspace.id}
-                    type="button"
-                    onClick={() => {
-                      void loginToWorkspace(workspace.id, workspace.name).catch((error) => {
-                        const message = error instanceof Error ? error.message : 'No pude abrir el workspace.';
-                        toast.error(message);
-                      });
-                    }}
-                    className="w-full rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-left transition-colors hover:border-cyan-500/40 hover:bg-slate-800"
+                    className="group flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 transition-colors hover:border-cyan-500/40 hover:bg-slate-800"
                   >
-                    <p className="font-semibold text-slate-100">{workspace.name}</p>
-                    <p className="mt-1 text-xs text-slate-500">Slug local: {workspace.slug}</p>
-                  </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void loginToWorkspace(workspace.id, workspace.name).catch((error) => {
+                          const message = error instanceof Error ? error.message : 'No pude abrir el workspace.';
+                          toast.error(message);
+                        });
+                      }}
+                      className="flex-1 text-left"
+                    >
+                      <p className="font-semibold text-slate-100">{workspace.name}</p>
+                      <p className="mt-1 text-xs text-slate-500">Slug local: {workspace.slug}</p>
+                    </button>
+                    {workspaces.length > 1 && (
+                      <WorkspaceDeleteButton 
+                        workspaceId={workspace.id} 
+                        workspaceName={workspace.name}
+                        onDeleted={async () => {
+                          const updated = await mutateWorkspaces();
+                          const latest = updated?.workspaces || [];
+                          return !latest.some((w) => w.id === workspace.id);
+                        }}
+                      />
+                    )}
+                  </div>
                 ))}
               </div>
             </div>
@@ -1595,26 +1823,50 @@ export default function Dashboard() {
 
   if (currentRoute === 'accounts') {
     const hasAccounts = igAccountsData && igAccountsData.length > 0;
+    const isAccountsLoading = !igAccountsData;
 
     return (
       <main className="min-h-screen bg-slate-950 flex flex-col items-center pt-16 p-4 text-slate-50">
-        {/* Active Accounts Wrapper */}
+        {/* Header with workspace switcher */}
         <div className="w-full max-w-5xl mb-8">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-2xl font-bold">Cuentas Vinculadas</h2>
             <div className="flex flex-wrap items-center gap-3">
-              <button onClick={() => connectInstagramAccount(false)} disabled={isLoggingIn} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60">
-                {isLoggingIn ? 'Conectando...' : 'Conectar otra cuenta'}
-              </button>
-              {hasAccounts && (
-                <button onClick={() => setCurrentRoute('app')} className="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm">
-                  Ir al Dashboard Principal
-                </button>
+              {!isAccountsLoading && (
+                <>
+                  <button onClick={() => setCurrentRoute('auth')} className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-sm font-medium text-slate-300 hover:bg-slate-700">
+                    Gestionar Workspaces
+                  </button>
+                  <button onClick={() => connectInstagramAccount(false)} disabled={isLoggingIn} className="rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-60">
+                    {isLoggingIn ? 'Conectando...' : 'Conectar otra cuenta'}
+                  </button>
+                  {hasAccounts && (
+                    <button onClick={() => setCurrentRoute('app')} className="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm">
+                      Ir al Dashboard Principal
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </div>
 
-          {hasAccounts ? (
+          {isAccountsLoading ? (
+            // Skeleton loading
+            <div className="space-y-4">
+              {[1, 2].map((i) => (
+                <div key={i} className="bg-slate-900 border border-slate-800 rounded-2xl p-5 animate-pulse">
+                  <div className="flex items-start gap-4">
+                    <div className="w-12 h-12 rounded-full bg-slate-800"></div>
+                    <div className="flex-1 space-y-3">
+                      <div className="h-5 bg-slate-800 rounded w-1/3"></div>
+                      <div className="h-3 bg-slate-800 rounded w-1/2"></div>
+                      <div className="h-2 bg-slate-800 rounded w-full"></div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : hasAccounts ? (
             <div className="grid grid-cols-1 gap-4">
               {igAccountsData.map((acc: IgAccount) => (
                 <div key={acc.id} className="bg-slate-900 border border-slate-800 rounded-2xl p-5 transition-all hover:border-slate-700">
@@ -1730,7 +1982,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        {!hasAccounts && <div className="w-full max-w-5xl bg-slate-900 border border-slate-800 rounded-3xl p-10 shadow-2xl relative animate-in fade-in slide-in-from-bottom-8">
+        {!isAccountsLoading && !hasAccounts && <div className="w-full max-w-5xl bg-slate-900 border border-slate-800 rounded-3xl p-10 shadow-2xl relative animate-in fade-in slide-in-from-bottom-8">
           <div className="absolute top-0 inset-x-0 h-1 bg-gradient-to-r from-emerald-500 to-teal-500"></div>
 
           <div className="text-center mb-10">
@@ -1765,7 +2017,7 @@ export default function Dashboard() {
           </div>
         </div>}
       </main>
-    )
+    );
   }
 
   // HARD BLOCK: Si no hay cuentas verificadas, no entra a la app.
@@ -1813,6 +2065,10 @@ export default function Dashboard() {
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-56 bg-slate-900 border-slate-800 text-slate-200">
               <DropdownMenuLabel>Workspace Local</DropdownMenuLabel>
+              <DropdownMenuSeparator className="bg-slate-800" />
+              <DropdownMenuItem onClick={() => setCurrentRoute('auth')} className="focus:bg-slate-800 focus:text-white cursor-pointer">
+                <SwitchCamera className="mr-2 h-4 w-4" /> Gestionar Workspaces
+              </DropdownMenuItem>
               <DropdownMenuSeparator className="bg-slate-800" />
               <DropdownMenuItem onClick={() => { setCurrentRoute('accounts'); }} className="focus:bg-slate-800 focus:text-white cursor-pointer">
                 <Users className="mr-2 h-4 w-4" /> Gestor de Cuentas IG
@@ -3060,6 +3316,8 @@ export default function Dashboard() {
                       {sortedCampaigns.map((campaign) => {
                         const isActive = campaign.status === 'running' || campaign.status === 'warmup' || campaign.status === 'paused';
                         const isExpanded = expandedCampaigns[campaign.id] ?? isActive;
+                        const isDeletingCampaign = !!campaignDeleteLoading[campaign.id];
+                        const isConfirmingCampaignDelete = !!campaignDeleteConfirming[campaign.id];
                         return (
                           <div key={campaign.id} className="p-5">
                             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -3245,10 +3503,23 @@ export default function Dashboard() {
                                     </button>
                                   )}
                                   <button
-                                    onClick={() => campaignAction(campaign.id, 'delete')}
-                                    className="rounded-xl border border-rose-500/30 px-4 py-2 text-sm font-medium text-rose-300 hover:bg-rose-500/10"
+                                    onClick={() => { void handleCampaignDelete(campaign.id, campaign.campaignName); }}
+                                    onBlur={() => { if (!isDeletingCampaign) clearCampaignDeleteConfirm(campaign.id); }}
+                                    disabled={isDeletingCampaign}
+                                    className={`rounded-xl border px-4 py-2 text-sm font-medium transition-colors ${
+                                      isDeletingCampaign
+                                        ? 'cursor-wait border-slate-600 bg-slate-700/60 text-slate-200'
+                                        : isConfirmingCampaignDelete
+                                          ? 'border-rose-400/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30'
+                                          : 'border-rose-500/30 text-rose-300 hover:bg-rose-500/10'
+                                    }`}
                                   >
-                                    Eliminar
+                                    {isDeletingCampaign ? (
+                                      <span className="inline-flex items-center gap-2">
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                        Eliminando...
+                                      </span>
+                                    ) : isConfirmingCampaignDelete ? 'Confirmar eliminar' : 'Eliminar'}
                                   </button>
                                 </div>
                               </div>
