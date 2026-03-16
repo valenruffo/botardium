@@ -11,7 +11,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--run-warmer":
     from scripts.core_warmer import main as warmer_main
     sys.exit(warmer_main())
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +21,6 @@ import re
 import sqlite3
 import time
 import subprocess
-from dotenv import load_dotenv
 import openai
 import json
 import asyncio
@@ -29,6 +28,7 @@ import sys
 import traceback
 import shutil
 import zipfile
+import io
 import urllib.request
 from packaging.version import Version, InvalidVersion
 from uuid import uuid4
@@ -36,14 +36,30 @@ from datetime import datetime
 from scripts.runtime_paths import (
     AGENTS_DIR,
     DB_DIR,
-    ENV_EXAMPLE_PATH,
-    ENV_PATH,
+    DB_PATH,
+    EXPORTS_TMP_DIR,
+    IMPORTS_TMP_DIR,
     PROFILE_PATH,
     SKILLS_DIR,
     TMP_DIR,
     SESSIONS_DIR,
     WRITABLE_ROOT,
+    ensure_runtime_dirs,
+    get_path_discovery_report,
+    verify_path_convergence,
 )
+from scripts.runtime_config import (
+    clear_legacy_workspace_ai_secrets,
+    detect_sensitive_import_content,
+    get_bootstrap_ai_config,
+    get_workspace_ai_config as get_runtime_workspace_ai_config,
+    load_bootstrap_env,
+    migrate_legacy_workspace_ai_secrets,
+    redact_secret,
+    sanitize_workspace_export_payload,
+    save_workspace_ai_config,
+)
+from scripts.auth import AuthActor, actor_from_request, build_session_payload
 
 try:
     from google import genai as google_genai
@@ -67,8 +83,25 @@ app = FastAPI(
 
 
 @app.get("/health")
-async def health() -> Dict[str, str]:
-    return {"status": "ok", "version": _current_app_version()}
+async def health() -> Dict[str, Any]:
+    path_info = verify_path_convergence()
+    return {
+        "status": "ok",
+        "version": _current_app_version(),
+        "path_convergence": path_info,
+    }
+
+
+@app.get("/health/detailed")
+async def health_detailed() -> Dict[str, Any]:
+    path_info = verify_path_convergence()
+    discovery = get_path_discovery_report()
+    return {
+        "status": "ok",
+        "version": _current_app_version(),
+        "paths": path_info,
+        "discovery": discovery,
+    }
 
 app.add_middleware(
     CORSMiddleware,
@@ -77,12 +110,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-LEGACY_DB_PATH = DB_DIR / "primebot.db"
-DB_PATH = DB_DIR / "botardium.db"
-
-if LEGACY_DB_PATH.exists() and not DB_PATH.exists():
-    LEGACY_DB_PATH.replace(DB_PATH)
-
+ensure_runtime_dirs()
 
 def _connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
@@ -117,6 +145,163 @@ def _workspace_name(workspace_id: int) -> str:
     return str(row["workspace_name"] or row["full_name"] or row["email"] or f"Workspace {workspace_id}")
 
 
+def _workspace_record(workspace_id: int) -> Dict[str, Any]:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, workspace_name, workspace_slug, full_name, email FROM users WHERE id = ? AND is_workspace = 1",
+        (workspace_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    return {
+        "id": int(row["id"]),
+        "workspace_name": str(row["workspace_name"] or row["full_name"] or row["email"] or f"Workspace {row['id']}"),
+        "workspace_slug": str(row["workspace_slug"] or _slugify_workspace_name(str(row["workspace_name"] or row["full_name"] or row["email"] or row["id"]))),
+    }
+
+
+def _audit_event(
+    action: str,
+    actor: AuthActor,
+    workspace_id: int,
+    outcome: str,
+    resource_type: str,
+    resource_id: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO audit_events (workspace_id, actor_id, action, outcome, resource_type, resource_id, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(workspace_id),
+            actor.actor_id,
+            action,
+            outcome,
+            resource_type,
+            resource_id,
+            detail or "",
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _require_actor(request: Request) -> AuthActor:
+    return actor_from_request(request)
+
+
+def _authorize_workspace_scope(
+    request: Request,
+    workspace_id: int,
+    *,
+    action: str,
+    resource_type: str,
+    resource_id: Optional[str] = None,
+) -> AuthActor:
+    actor = _require_actor(request)
+    target_workspace_id = int(workspace_id)
+    if actor.workspace_id != target_workspace_id:
+        _audit_event(
+            action,
+            actor,
+            actor.workspace_id,
+            "denied",
+            resource_type,
+            resource_id=resource_id,
+            detail=f"cross-workspace target={target_workspace_id}",
+        )
+        raise HTTPException(status_code=403, detail="No estás autorizado para operar sobre otro workspace.")
+    return actor
+
+
+def _authorize_account_scope(request: Request, account_id: int, *, action: str) -> tuple[AuthActor, Dict[str, Any]]:
+    account = _get_account(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
+    actor = _authorize_workspace_scope(
+        request,
+        int(account["user_id"]),
+        action=action,
+        resource_type="account",
+        resource_id=str(account_id),
+    )
+    return actor, account
+
+
+def _authorize_campaign_scope(request: Request, campaign_id: str, *, action: str) -> tuple[AuthActor, Dict[str, Any]]:
+    campaign = CAMPAIGN_STORE.get(campaign_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campana no encontrada.")
+    actor = _authorize_workspace_scope(
+        request,
+        int(campaign.get("workspace_id") or 0),
+        action=action,
+        resource_type="campaign",
+        resource_id=campaign_id,
+    )
+    return actor, campaign
+
+
+def _lead_workspace_map(lead_ids: List[int]) -> Dict[int, int]:
+    if not lead_ids:
+        return {}
+    conn = _connect_db()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in lead_ids)
+    cursor.execute(
+        f"SELECT id, workspace_id FROM leads WHERE id IN ({placeholders})",
+        lead_ids,
+    )
+    rows = {int(row["id"]): int(row["workspace_id"] or 0) for row in cursor.fetchall()}
+    conn.close()
+    return rows
+
+
+def _authorize_lead_scope(request: Request, lead_id: int, *, action: str) -> tuple[AuthActor, int]:
+    lead_workspaces = _lead_workspace_map([lead_id])
+    workspace_id = lead_workspaces.get(int(lead_id))
+    if not workspace_id:
+        raise HTTPException(status_code=404, detail="Lead no encontrado.")
+    actor = _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action=action,
+        resource_type="lead",
+        resource_id=str(lead_id),
+    )
+    return actor, workspace_id
+
+
+def _authorize_lead_ids_scope(request: Request, lead_ids: List[int], *, action: str) -> AuthActor:
+    actor = _require_actor(request)
+    if not lead_ids:
+        return actor
+    lead_workspaces = _lead_workspace_map(lead_ids)
+    if not lead_workspaces:
+        raise HTTPException(status_code=404, detail="No se encontraron leads para esta acción.")
+    cross_workspace_ids = [lead_id for lead_id, workspace_id in lead_workspaces.items() if workspace_id != actor.workspace_id]
+    if cross_workspace_ids:
+        _audit_event(
+            action,
+            actor,
+            actor.workspace_id,
+            "denied",
+            "lead",
+            resource_id=",".join(str(lead_id) for lead_id in sorted(cross_workspace_ids)),
+            detail="cross-workspace lead access denied",
+        )
+        raise HTTPException(status_code=403, detail="Uno o más leads pertenecen a otro workspace.")
+    return actor
+
+
 def _set_workspace_env(workspace_id: int) -> tuple[str | None, str | None]:
     prev_id = os.environ.get("BOTARDIUM_WORKSPACE_ID")
     prev_slug = os.environ.get("BOTARDIUM_WORKSPACE_SLUG")
@@ -138,13 +323,8 @@ def _restore_workspace_env(previous: tuple[str | None, str | None]) -> None:
 
 
 def _workspace_ai_config(workspace_id: Optional[int]) -> Dict[str, str]:
-    google_key = GOOGLE_API_KEY
-    openai_key = os.getenv("OPENAI_API_KEY", "") or ""
     if not workspace_id:
-        return {
-            "google_api_key": google_key.strip(),
-            "openai_api_key": openai_key.strip(),
-        }
+        return get_bootstrap_ai_config()
 
     conn = _connect_db()
     cursor = conn.cursor()
@@ -154,13 +334,11 @@ def _workspace_ai_config(workspace_id: Optional[int]) -> Dict[str, str]:
     )
     row = cursor.fetchone()
     conn.close()
-    if row:
-        google_key = str(row["google_api_key"] or google_key or "").strip()
-        openai_key = str(row["openai_api_key"] or openai_key or "").strip()
-    return {
-        "google_api_key": google_key,
-        "openai_api_key": openai_key,
+    legacy = {
+        "google_api_key": str(row["google_api_key"] or "").strip() if row else "",
+        "openai_api_key": str(row["openai_api_key"] or "").strip() if row else "",
     }
+    return get_runtime_workspace_ai_config(workspace_id, legacy)
 
 
 def _workspace_ai_status(workspace_id: Optional[int]) -> Dict[str, Any]:
@@ -180,10 +358,7 @@ def _workspace_ai_status(workspace_id: Optional[int]) -> Dict[str, Any]:
 
 
 def _mask_key(value: str) -> str:
-    key = str(value or "").strip()
-    if len(key) <= 8:
-        return "*" * len(key)
-    return f"{key[:4]}...{key[-4:]}"
+    return redact_secret(value)
 
 
 def _downloads_dir() -> Path:
@@ -217,13 +392,7 @@ def _table_columns(cursor: sqlite3.Cursor, table_name: str) -> List[str]:
     return [str(row[1]) for row in cursor.fetchall()]
 
 
-def _copy_workspace_sessions(workspace_slug: str, destination: Path) -> None:
-    source = _workspace_session_dir(workspace_slug)
-    if source.exists():
-        shutil.copytree(source, destination, dirs_exist_ok=True)
-
-
-def _build_workspace_export(workspace_id: int) -> Path:
+def _build_workspace_export(workspace_id: int) -> tuple[Path, list[str]]:
     conn = _connect_db()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = ?", (workspace_id,))
@@ -234,7 +403,7 @@ def _build_workspace_export(workspace_id: int) -> Path:
 
     workspace_slug = str(workspace["workspace_slug"] or f"workspace-{workspace_id}")
     workspace_name = str(workspace["workspace_name"] or workspace["full_name"] or workspace["email"] or workspace_slug)
-    export_root = TMP_DIR / "workspace_exports" / f"{workspace_slug}-{int(time.time())}"
+    export_root = EXPORTS_TMP_DIR / f"{workspace_slug}-{int(time.time())}"
     if export_root.exists():
         shutil.rmtree(export_root, ignore_errors=True)
     export_root.mkdir(parents=True, exist_ok=True)
@@ -258,8 +427,20 @@ def _build_workspace_export(workspace_id: int) -> Path:
         "campaigns_cache": campaigns,
         "message_jobs_cache": jobs,
     }
-    (export_root / "workspace.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    _copy_workspace_sessions(workspace_slug, export_root / "sessions")
+    sanitized_payload, omitted_data_classes = sanitize_workspace_export_payload(payload)
+    (export_root / "workspace.json").write_text(json.dumps(sanitized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (export_root / "export_notice.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "omitted_data_classes": omitted_data_classes,
+                "message": "Botardium omite por defecto AI keys, credenciales reutilizables y material de sesion en los exports.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     downloads_dir = _downloads_dir()
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -270,7 +451,7 @@ def _build_workspace_export(workspace_id: int) -> Path:
         for file_path in export_root.rglob("*"):
             if file_path.is_file():
                 archive.write(file_path, file_path.relative_to(export_root))
-    return archive_path
+    return archive_path, omitted_data_classes
 
 
 def _import_workspace_archive(zip_path: str) -> Dict[str, Any]:
@@ -278,17 +459,28 @@ def _import_workspace_archive(zip_path: str) -> Dict[str, Any]:
     if not source.exists() or source.suffix.lower() != ".zip":
         raise HTTPException(status_code=400, detail="Selecciona un ZIP de workspace válido.")
 
-    import_root = TMP_DIR / "workspace_imports" / f"import-{int(time.time())}"
-    if import_root.exists():
-        shutil.rmtree(import_root, ignore_errors=True)
-    import_root.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(source, "r") as archive:
+        archive_names = archive.namelist()
+        if "workspace.json" not in archive_names:
+            raise HTTPException(status_code=400, detail="El archivo no contiene un workspace exportado por Botardium.")
+        with archive.open("workspace.json", "r") as payload_file:
+            payload = json.load(io.TextIOWrapper(payload_file, encoding="utf-8"))
+        prohibited_content = detect_sensitive_import_content(payload, archive_names=archive_names)
+        if prohibited_content:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "El import fue rechazado porque contiene secretos o material de sesion reutilizable.",
+                    "prohibited_content_classes": prohibited_content,
+                },
+            )
+
+        import_root = IMPORTS_TMP_DIR / f"import-{int(time.time())}"
+        if import_root.exists():
+            shutil.rmtree(import_root, ignore_errors=True)
+        import_root.mkdir(parents=True, exist_ok=True)
         archive.extractall(import_root)
 
-    payload_path = import_root / "workspace.json"
-    if not payload_path.exists():
-        raise HTTPException(status_code=400, detail="El archivo no contiene un workspace exportado por Botardium.")
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
     workspace_payload = payload.get("workspace") or {}
     requested_name = str(workspace_payload.get("workspace_name") or workspace_payload.get("full_name") or "Workspace importado").strip()
 
@@ -310,24 +502,33 @@ def _import_workspace_archive(zip_path: str) -> Dict[str, Any]:
             requested_name,
             requested_name,
             slug,
-            str(workspace_payload.get("google_api_key") or ""),
-            str(workspace_payload.get("openai_api_key") or ""),
+            "",
+            "",
         ),
     )
-    new_workspace_id = int(cursor.lastrowid)
+    new_workspace_id_raw = cursor.lastrowid
+    if new_workspace_id_raw is None:
+        conn.close()
+        raise HTTPException(status_code=500, detail="No pude crear el workspace importado.")
+    new_workspace_id = int(new_workspace_id_raw)
 
     account_id_map: Dict[int, int] = {}
     for account in payload.get("ig_accounts", []):
         record = dict(account)
         old_account_id = int(record.pop("id"))
         record["user_id"] = new_workspace_id
+        record["ig_password"] = str(record.get("ig_password") or "")
         columns = list(record.keys())
         placeholders = ", ".join("?" for _ in columns)
         cursor.execute(
             f"INSERT INTO ig_accounts ({', '.join(columns)}) VALUES ({placeholders})",
             [record[column] for column in columns],
         )
-        account_id_map[old_account_id] = int(cursor.lastrowid)
+        last_account_id = cursor.lastrowid
+        if last_account_id is None:
+            conn.close()
+            raise HTTPException(status_code=500, detail="No pude restaurar una cuenta de Instagram importada.")
+        account_id_map[old_account_id] = int(last_account_id)
 
     campaign_id_map: Dict[str, str] = {}
     for campaign in payload.get("campaigns_cache", []):
@@ -372,11 +573,12 @@ def _import_workspace_archive(zip_path: str) -> Dict[str, Any]:
     conn.commit()
     conn.close()
 
-    session_source = import_root / "sessions"
-    if session_source.exists():
-        shutil.copytree(session_source, _workspace_session_dir(slug), dirs_exist_ok=True)
-
-    return {"workspace_id": new_workspace_id, "name": requested_name, "slug": slug}
+    return {
+        "workspace_id": new_workspace_id,
+        "name": requested_name,
+        "slug": slug,
+        "rebind_required": ["ai_keys", "credentials", "session_material"],
+    }
 
 
 def _latest_release_status(current_version: str) -> Dict[str, Any]:
@@ -574,6 +776,21 @@ def init_db():
         )
         '''
     )
+    cursor.execute(
+        '''
+        CREATE TABLE IF NOT EXISTS audit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id INTEGER NOT NULL,
+            actor_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT,
+            detail TEXT,
+            created_at TEXT NOT NULL
+        )
+        '''
+    )
     cursor.execute("UPDATE leads SET status = 'Completado' WHERE status = 'Contactado'")
     conn.commit()
     conn.close()
@@ -676,18 +893,17 @@ def cleanup_legacy_message_previews() -> int:
 @app.on_event("startup")
 def startup_event():
     init_db()
+    conn = _connect_db()
+    migrate_legacy_workspace_ai_secrets(conn)
+    conn.commit()
+    conn.close()
     _ensure_leads_workspace_safe_schema()
     _load_persisted_runtime_state()
     cleanup_legacy_message_previews()
 
-# Cargar variables de entorno locales
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
-else:
-    load_dotenv(ENV_EXAMPLE_PATH)
-
+load_bootstrap_env()
 openai.api_key = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
+GOOGLE_API_KEY = get_bootstrap_ai_config()["google_api_key"]
 
 # ----------------------------------------------------- #
 # Models
@@ -821,6 +1037,11 @@ class AccountBulkWarmupRequest(BaseModel):
 
 class WorkspaceCreateReq(BaseModel):
     name: str
+
+
+class WorkspaceLoginRequest(BaseModel):
+    workspace_id: int
+
 
 class AccountAddReq(BaseModel):
     workspace_id: int
@@ -1337,6 +1558,7 @@ async def _run_campaign_simulation(campaign_id: str) -> None:
             campaign = CAMPAIGN_STORE.get(campaign_id)
             if not campaign or campaign.get("status") != "running":
                 return
+            assert campaign is not None
 
             campaign["current_action"] = step_message
             completed_steps += 1
@@ -1405,23 +1627,24 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
             campaign = CAMPAIGN_STORE.get(campaign_id)
             if not campaign or campaign.get("status") != "running":
                 return
+            active_campaign = campaign
 
             source_label = f"{source['type']}:{source['value']}"
-            campaign_username = str(campaign["username"])
-            source_filters = _filters_for_source(campaign.get("filters", {}), source["type"])
-            existing_stats = campaign.setdefault("source_stats", {}).get(source_label)
-            if isinstance(existing_stats, dict) and campaign.get("status") == "running":
+            campaign_username = str(active_campaign["username"])
+            source_filters = _filters_for_source(active_campaign.get("filters") or {}, source["type"])
+            existing_stats = active_campaign.setdefault("source_stats", {}).get(source_label)
+            if isinstance(existing_stats, dict) and active_campaign.get("status") == "running":
                 accepted_base = int(existing_stats.get("accepted") or 0)
                 rejected_base = existing_stats.get("rejected") if isinstance(existing_stats.get("rejected"), dict) else {}
             else:
                 accepted_base = 0
                 rejected_base = {}
-            campaign.setdefault("source_stats", {})[source_label] = {
+            active_campaign.setdefault("source_stats", {})[source_label] = {
                 "accepted": accepted_base,
                 "rejected": rejected_base,
                 "status": "running",
             }
-            _append_campaign_log(campaign, f"Ejecutando extractor real sobre {source_label}.")
+            _append_campaign_log(active_campaign, f"Ejecutando extractor real sobre {source_label}.")
             if STATUS_FILE.exists():
                 STATUS_FILE.unlink()
 
@@ -1430,7 +1653,7 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                previous_env = _set_workspace_env(int(campaign.get("workspace_id") or 0))
+                previous_env = _set_workspace_env(int(active_campaign.get("workspace_id") or 0))
                 try:
                     return loop.run_until_complete(
                         run_scraper(
@@ -2217,6 +2440,30 @@ def _normalize_strategy_payload(data: Dict[str, Any], prompt: str) -> MagicBoxRe
 # ----------------------------------------------------- #
 # Workspaces locales (modelo desktop local-first)
 # ----------------------------------------------------- #
+@app.post("/api/auth/login")
+async def login_workspace(payload: WorkspaceLoginRequest):
+    workspace = _workspace_record(payload.workspace_id)
+    return {
+        "auth": build_session_payload(
+            workspace["id"],
+            workspace["workspace_slug"],
+            workspace["workspace_name"],
+        )
+    }
+
+
+@app.get("/api/auth/session")
+async def get_auth_session(request: Request):
+    actor = _require_actor(request)
+    return {
+        "workspace_id": actor.workspace_id,
+        "workspace_slug": actor.workspace_slug,
+        "workspace_name": actor.workspace_name,
+        "actor_id": actor.actor_id,
+        "expires_at": actor.expires_at,
+    }
+
+
 @app.get("/api/workspaces")
 async def list_workspaces():
     conn = _connect_db()
@@ -2260,25 +2507,51 @@ async def create_workspace(req: WorkspaceCreateReq):
         "INSERT INTO users (email, password_hash, full_name, workspace_name, workspace_slug, is_workspace) VALUES (?, '', ?, ?, ?, 1)",
         (synthetic_email, workspace_name, workspace_name, slug),
     )
-    workspace_id = int(cursor.lastrowid)
+    workspace_id_raw = cursor.lastrowid
+    if workspace_id_raw is None:
+        conn.close()
+        raise HTTPException(status_code=500, detail="No pude crear el workspace.")
+    workspace_id = int(workspace_id_raw)
     conn.commit()
     conn.close()
-    return {"workspace_id": workspace_id, "name": workspace_name, "slug": slug}
+    return {
+        "workspace_id": workspace_id,
+        "name": workspace_name,
+        "slug": slug,
+        "auth": build_session_payload(workspace_id, slug, workspace_name),
+    }
 
 
 @app.post("/api/workspaces/{workspace_id}/export")
-async def export_workspace(workspace_id: int):
-    archive_path = _build_workspace_export(workspace_id)
+async def export_workspace(workspace_id: int, request: Request):
+    actor = _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="workspace.export",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
+    archive_path, omitted_data_classes = _build_workspace_export(workspace_id)
+    _audit_event("workspace.export", actor, workspace_id, "allowed", "workspace", resource_id=str(workspace_id))
     return {
         "status": "exported",
         "path": str(archive_path),
         "filename": archive_path.name,
+        "omitted_data_classes": omitted_data_classes,
     }
 
 
 @app.post("/api/workspaces/import")
 async def import_workspace(payload: WorkspaceImportRequest):
-    return _import_workspace_archive(payload.zip_path)
+    response = _import_workspace_archive(payload.zip_path)
+    return {
+        **response,
+        "auth": build_session_payload(
+            int(response["workspace_id"]),
+            str(response["slug"]),
+            str(response["name"]),
+        ),
+    }
 
 
 @app.get("/api/app/update-status")
@@ -2286,7 +2559,14 @@ async def get_app_update_status(current_version: Optional[str] = None):
     return _latest_release_status(current_version or _current_app_version())
 
 @app.get("/api/accounts")
-async def get_accounts(workspace_id: int):
+async def get_accounts(workspace_id: int, request: Request):
+    _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="accounts.list",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
     conn = _connect_db()
     cursor = conn.cursor()
     cursor.execute(
@@ -2378,7 +2658,7 @@ async def _extract_instagram_username(page) -> str:
     raise HTTPException(status_code=400, detail="Login detectado pero no se pudo extraer el nombre de usuario.")
 
 @app.post("/api/ig/login")
-async def login_browser(req: LoginBrowserReq):
+async def login_browser(req: LoginBrowserReq, request: Request):
     """
     Abre un browser Chromium visible para que el usuario se loguee en Instagram.
     Detecta automáticamente el usuario logueado y lo registra en la base de datos.
@@ -2394,7 +2674,14 @@ async def login_browser(req: LoginBrowserReq):
     
     ig_username = None
     try:
-        workspace_slug = _workspace_slug(req.workspace_id)
+        actor = _authorize_workspace_scope(
+            request,
+            req.workspace_id,
+            action="account.login_browser",
+            resource_type="workspace",
+            resource_id=str(req.workspace_id),
+        )
+        workspace_slug = actor.workspace_slug
         await page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded")
         await asyncio.sleep(2)
 
@@ -2433,6 +2720,7 @@ async def login_browser(req: LoginBrowserReq):
         acc_id = cursor.lastrowid
         conn.commit()
         conn.close()
+        _audit_event("account.login_browser", actor, actor.workspace_id, "allowed", "account", resource_id=str(acc_id))
         return {"account_id": acc_id, "ig_username": ig_username, "status": "verified"}
     except HTTPException as he:
         raise he
@@ -2446,8 +2734,16 @@ async def add_account_legacy(req: AccountAddReq):
 
 
 @app.post("/api/accounts/warmup-bulk")
-async def bulk_account_warmup(payload: AccountBulkWarmupRequest):
+async def bulk_account_warmup(payload: AccountBulkWarmupRequest, request: Request):
     from scripts.session_manager import session_exists
+
+    actor = _authorize_workspace_scope(
+        request,
+        payload.workspace_id,
+        action="account.warmup_bulk",
+        resource_type="workspace",
+        resource_id=str(payload.workspace_id),
+    )
 
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -2496,11 +2792,13 @@ async def bulk_account_warmup(payload: AccountBulkWarmupRequest):
         )
         queued += 1
 
+    _audit_event("account.warmup_bulk", actor, actor.workspace_id, "allowed", "workspace", resource_id=str(actor.workspace_id), detail=f"queued={queued}")
     return {"status": "queued", "queued": queued}
 
 
 @app.post("/api/accounts/{account_id}/profile")
-async def update_account_profile(account_id: int, payload: AccountProfileUpdateRequest):
+async def update_account_profile(account_id: int, payload: AccountProfileUpdateRequest, request: Request):
+    actor, _account = _authorize_account_scope(request, account_id, action="account.profile.update")
     account_type = payload.account_type.strip().lower()
     if account_type not in {"mature", "new", "rehab"}:
         raise HTTPException(status_code=400, detail="Tipo de cuenta invalido.")
@@ -2517,14 +2815,13 @@ async def update_account_profile(account_id: int, payload: AccountProfileUpdateR
         daily_dm_limit=daily_limit,
     )
     account = _get_account(account_id)
+    _audit_event("account.profile.update", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
     return {"status": "updated", "account": _serialize_account(account or {"id": account_id, "account_type": account_type})}
 
 
 @app.post("/api/accounts/{account_id}/account-warmup-day")
-async def complete_account_warmup_day(account_id: int):
-    account = _get_account(account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
+async def complete_account_warmup_day(account_id: int, request: Request):
+    actor, account = _authorize_account_scope(request, account_id, action="account.warmup_day.complete")
     total = max(int(account.get("account_warmup_days_total") or 0), 1)
     completed = min(total, int(account.get("account_warmup_days_completed") or 0) + 1)
     status = "completed" if completed >= total else "in_progress"
@@ -2534,16 +2831,15 @@ async def complete_account_warmup_day(account_id: int):
         account_warmup_status=status,
         current_action=("Calentamiento de cuenta completado." if status == "completed" else f"Calentamiento de cuenta dia {completed}/{total}."),
     )
+    _audit_event("account.warmup_day.complete", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
     return {"status": "updated", "completed_days": completed, "total_days": total}
 
 
 @app.post("/api/accounts/{account_id}/warmup")
-async def warmup_account(account_id: int, payload: AccountWarmupRequest):
+async def warmup_account(account_id: int, payload: AccountWarmupRequest, request: Request):
     from scripts.session_manager import session_exists
 
-    account = _get_account(account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
+    actor, account = _authorize_account_scope(request, account_id, action="account.warmup.start")
 
     if not session_exists(account["ig_username"], _workspace_slug(int(account["user_id"]))):
         _update_account_runtime(
@@ -2572,11 +2868,13 @@ async def warmup_account(account_id: int, payload: AccountWarmupRequest):
     ACCOUNT_WARMUP_TASKS[account_id] = asyncio.create_task(
         _run_account_warmup(account_id, account["ig_username"], payload.duration_min)
     )
+    _audit_event("account.warmup.start", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
     return {"status": "queued", "account_id": account_id}
 
 
 @app.post("/api/accounts/{account_id}/warmup-cancel")
-async def cancel_account_warmup(account_id: int):
+async def cancel_account_warmup(account_id: int, request: Request):
+    actor, _account = _authorize_account_scope(request, account_id, action="account.warmup.cancel")
     task = ACCOUNT_WARMUP_TASKS.get(account_id)
     if task and not task.done():
         task.cancel()
@@ -2586,14 +2884,13 @@ async def cancel_account_warmup(account_id: int):
         warmup_progress=0,
         current_action="Warmup cancelado por operador.",
     )
+    _audit_event("account.warmup.cancel", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
     return {"status": "cancelled", "account_id": account_id}
 
 
 @app.post("/api/accounts/{account_id}/relogin")
-async def relogin_account(account_id: int):
-    account = _get_account(account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Cuenta no encontrada.")
+async def relogin_account(account_id: int, request: Request):
+    actor, account = _authorize_account_scope(request, account_id, action="account.relogin")
 
     session = None
     expected_username = str(account.get("ig_username") or "").strip().lstrip("@").lower()
@@ -2625,7 +2922,7 @@ async def relogin_account(account_id: int):
                 detail=f"Logueaste @{logged_username}, pero esta cuenta es @{expected_username}. Reintenta con la cuenta correcta.",
             )
 
-        await _save_instagram_session(expected_username, context)
+        await _save_instagram_session(expected_username, context, actor.workspace_slug)
         _update_account_runtime(
             account_id,
             session_status="verified",
@@ -2635,6 +2932,7 @@ async def relogin_account(account_id: int):
             warmup_progress=0,
             session_warmup_phase="idle",
         )
+        _audit_event("account.relogin", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
         return {"status": "ok", "account_id": account_id, "ig_username": expected_username}
     except HTTPException as exc:
         detail_msg = exc.detail if isinstance(exc.detail, str) and exc.detail.strip() else "Re-login abortado por una validacion de cuenta."
@@ -2661,7 +2959,8 @@ async def relogin_account(account_id: int):
             await close_stealth_browser(session)
 
 @app.delete("/api/accounts/{account_id}")
-async def delete_account(account_id: int):
+async def delete_account(account_id: int, request: Request):
+    actor, _account = _authorize_account_scope(request, account_id, action="account.delete")
     task = ACCOUNT_WARMUP_TASKS.pop(account_id, None)
     if task and not task.done():
         task.cancel()
@@ -2670,18 +2969,32 @@ async def delete_account(account_id: int):
     cursor.execute("DELETE FROM ig_accounts WHERE id = ?", (account_id,))
     conn.commit()
     conn.close()
+    _audit_event("account.delete", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
     return {"message": "Cuenta eliminada correctamente"}
 
 # ----------------------------------------------------- #
 # Endpoints de IA (Magic Box)
 # ----------------------------------------------------- #
 @app.post("/api/ai/strategy", response_model=MagicBoxResponse)
-async def generate_strategy(payload: MagicBoxRequest):
+async def generate_strategy(payload: MagicBoxRequest, request: Request):
     """
     Magic Box Brain: Procesa un input de lenguaje natural 
     y utiliza OpenAI para determinar la estrategia de scraping óptima.
     """
-    ai_config = _workspace_ai_config(payload.workspace_id)
+    actor = _require_actor(request)
+    workspace_id = actor.workspace_id
+    if payload.workspace_id is not None and int(payload.workspace_id) != workspace_id:
+        _audit_event(
+            "ai.strategy.generate",
+            actor,
+            workspace_id,
+            "denied",
+            "workspace",
+            resource_id=str(payload.workspace_id),
+            detail="cross-workspace AI strategy request",
+        )
+        raise HTTPException(status_code=403, detail="No estás autorizado para usar AI sobre otro workspace.")
+    ai_config = _workspace_ai_config(workspace_id)
     openai_api_key = ai_config["openai_api_key"]
     google_api_key = ai_config["google_api_key"]
     if not openai_api_key and not google_api_key:
@@ -2761,7 +3074,14 @@ async def generate_strategy(payload: MagicBoxRequest):
 
 
 @app.get("/api/workspaces/{workspace_id}/ai-settings")
-async def get_workspace_ai_settings(workspace_id: int):
+async def get_workspace_ai_settings(workspace_id: int, request: Request):
+    _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="workspace.ai_settings.read",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
     config = _workspace_ai_config(workspace_id)
     status = _workspace_ai_status(workspace_id)
     return {
@@ -2772,28 +3092,47 @@ async def get_workspace_ai_settings(workspace_id: int):
 
 
 @app.post("/api/workspaces/{workspace_id}/ai-settings")
-async def update_workspace_ai_settings(workspace_id: int, payload: WorkspaceAiSettingsRequest):
+async def update_workspace_ai_settings(workspace_id: int, payload: WorkspaceAiSettingsRequest, request: Request):
+    actor = _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="workspace.ai_settings.update",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
     conn = _connect_db()
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE users SET google_api_key = ?, openai_api_key = ? WHERE id = ?",
-        ((payload.google_api_key or "").strip(), (payload.openai_api_key or "").strip(), workspace_id),
-    )
-    conn.commit()
-    changed = cursor.rowcount
-    conn.close()
-    if not changed:
+    cursor.execute("SELECT id FROM users WHERE id = ?", (workspace_id,))
+    exists = cursor.fetchone()
+    if not exists:
+        conn.close()
         raise HTTPException(status_code=404, detail="Workspace no encontrado.")
+    save_workspace_ai_config(
+        workspace_id,
+        google_api_key=(payload.google_api_key or "").strip(),
+        openai_api_key=(payload.openai_api_key or "").strip(),
+    )
+    clear_legacy_workspace_ai_secrets(conn, workspace_id)
+    conn.commit()
+    conn.close()
+    _audit_event("workspace.ai_settings.update", actor, workspace_id, "allowed", "workspace", resource_id=str(workspace_id))
     return {"status": "saved", **_workspace_ai_status(workspace_id)}
 
 # ----------------------------------------------------- #
 # Endpoints de Bot Engine Core
 # ----------------------------------------------------- #
 @app.post("/api/bot/start")
-async def start_bot(config: CampaignStartRequest):
+async def start_bot(config: CampaignStartRequest, request: Request):
     """
     Lanza la tarea asíncrona de Patchright Scraper/Outreach.
     """
+    actor = _authorize_workspace_scope(
+        request,
+        config.workspace_id,
+        action="campaign.create",
+        resource_type="workspace",
+        resource_id=str(config.workspace_id),
+    )
     normalized_sources = []
     warmup_mode = config.warmup_mode.strip().lower()
     if warmup_mode not in ALLOWED_WARMUP_MODES:
@@ -2842,8 +3181,8 @@ async def start_bot(config: CampaignStartRequest):
 
     campaign = {
         "id": campaign_id,
-        "workspace_id": int(config.workspace_id),
-        "workspace_name": _workspace_name(int(config.workspace_id)),
+        "workspace_id": actor.workspace_id,
+        "workspace_name": _workspace_name(actor.workspace_id),
         "campaign_name": normalized_name[:80],
         "username": config.username,
         "limit": normalized_limit,
@@ -2871,6 +3210,7 @@ async def start_bot(config: CampaignStartRequest):
     _append_campaign_log(campaign, initial_action)
     CAMPAIGN_STORE[campaign_id] = campaign
     _persist_campaign(campaign)
+    _audit_event("campaign.create", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
 
     return {
         "status": "started",
@@ -2878,8 +3218,15 @@ async def start_bot(config: CampaignStartRequest):
     }
 
 @app.get("/api/bot/status")
-async def get_bot_status(workspace_id: int):
+async def get_bot_status(workspace_id: int, request: Request):
     """Retorna el progreso en tiempo real (Polling)."""
+    _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="campaign.status.read",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
     campaigns = _workspace_campaigns(workspace_id)
     return {
         "is_running": any(campaign.get("status") == "running" for campaign in campaigns),
@@ -2888,10 +3235,8 @@ async def get_bot_status(workspace_id: int):
 
 
 @app.post("/api/bot/{campaign_id}/action")
-async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
-    campaign = CAMPAIGN_STORE.get(campaign_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campana no encontrada.")
+async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, request: Request):
+    actor, campaign = _authorize_campaign_scope(request, campaign_id, action="campaign.action")
 
     action = payload.action.strip().lower()
 
@@ -2906,6 +3251,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         conn.close()
         del CAMPAIGN_STORE[campaign_id]
         _delete_campaign(campaign_id)
+        _audit_event("campaign.delete", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "deleted", "campaign_id": campaign_id}
 
     if action == "rename":
@@ -2915,6 +3261,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["campaign_name"] = normalized_name[:80]
         _append_campaign_log(campaign, f"Nombre de campaña actualizado a: {campaign['campaign_name']}")
         _persist_campaign(campaign)
+        _audit_event("campaign.rename", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_warmup":
@@ -2927,6 +3274,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["current_action"] = f"Warmup real en cola ({campaign['warmup_minutes']} min)"
         _append_campaign_log(campaign, campaign["current_action"])
         _persist_campaign(campaign)
+        _audit_event("campaign.start_warmup", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "finish_warmup":
@@ -2935,6 +3283,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["current_action"] = "Warmup completo. Lista para comenzar scraping."
         _append_campaign_log(campaign, campaign["current_action"])
         _persist_campaign(campaign)
+        _audit_event("campaign.finish_warmup", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_scraping":
@@ -2943,6 +3292,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
             raise HTTPException(status_code=400, detail="La campana ya esta ejecutandose.")
         runner = _run_campaign_scraping if campaign.get("execution_mode") == "real" else _run_campaign_simulation
         CAMPAIGN_TASKS[campaign_id] = asyncio.create_task(runner(campaign_id))
+        _audit_event("campaign.start_scraping", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "pause":
@@ -2953,14 +3303,22 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest):
         campaign["current_action"] = f"Scraping pausado en {int(campaign.get('progress') or 0)}%. Puedes reanudar cuando quieras."
         _append_campaign_log(campaign, campaign["current_action"])
         _persist_campaign(campaign)
+        _audit_event("campaign.pause", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     raise HTTPException(status_code=400, detail="Accion no soportada.")
 
 @app.get("/api/leads")
-async def get_leads(workspace_id: int, campaign_id: Optional[str] = None):
+async def get_leads(workspace_id: int, request: Request, campaign_id: Optional[str] = None):
     """Retorna los datos del CRM desde SQLite/Postgres."""
     try:
+        _authorize_workspace_scope(
+            request,
+            workspace_id,
+            action="lead.list",
+            resource_type="workspace",
+            resource_id=str(workspace_id),
+        )
         conn = _connect_db()
         cursor = conn.cursor()
         base_query = """
@@ -3003,47 +3361,57 @@ async def get_leads(workspace_id: int, campaign_id: Optional[str] = None):
 
 
 @app.delete("/api/leads/{lead_id}")
-async def delete_lead(lead_id: int):
+async def delete_lead(lead_id: int, request: Request):
+    actor, _workspace_id = _authorize_lead_scope(request, lead_id, action="lead.delete")
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     cursor.execute("DELETE FROM leads WHERE id = ?", (lead_id,))
     conn.commit()
     conn.close()
+    _audit_event("lead.delete", actor, actor.workspace_id, "allowed", "lead", resource_id=str(lead_id))
     return {"status": "deleted", "lead_id": lead_id}
 
 
 @app.post("/api/leads/bulk-delete")
-async def bulk_delete_leads(payload: LeadBulkRequest):
+async def bulk_delete_leads(payload: LeadBulkRequest, request: Request):
+    actor = _authorize_lead_ids_scope(request, payload.ids, action="lead.bulk_delete")
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     if payload.ids:
         placeholders = ",".join("?" for _ in payload.ids)
-        cursor.execute(f"DELETE FROM leads WHERE id IN ({placeholders})", payload.ids)
+        cursor.execute(f"DELETE FROM leads WHERE workspace_id = ? AND id IN ({placeholders})", [actor.workspace_id, *payload.ids])
     else:
-        cursor.execute("DELETE FROM leads")
+        cursor.execute("DELETE FROM leads WHERE workspace_id = ?", (actor.workspace_id,))
     conn.commit()
     conn.close()
+    _audit_event("lead.bulk_delete", actor, actor.workspace_id, "allowed", "lead", detail=(f"count={len(payload.ids)}" if payload.ids else "all-workspace-leads"))
     return {"status": "deleted", "count": len(payload.ids) if payload.ids else "all"}
 
 
 @app.post("/api/leads/bulk-status")
-async def bulk_update_leads_status(payload: LeadBulkRequest):
+async def bulk_update_leads_status(payload: LeadBulkRequest, request: Request):
     if not payload.ids:
         raise HTTPException(status_code=400, detail="Debes enviar ids para actualizar estado.")
     if not payload.status:
         raise HTTPException(status_code=400, detail="Debes enviar un status valido.")
 
+    actor = _authorize_lead_ids_scope(request, payload.ids, action="lead.bulk_status")
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
     placeholders = ",".join("?" for _ in payload.ids)
-    cursor.execute(f"UPDATE leads SET status = ? WHERE id IN ({placeholders})", [payload.status, *payload.ids])
+    cursor.execute(
+        f"UPDATE leads SET status = ? WHERE workspace_id = ? AND id IN ({placeholders})",
+        [payload.status, actor.workspace_id, *payload.ids],
+    )
     conn.commit()
     conn.close()
+    _audit_event("lead.bulk_status", actor, actor.workspace_id, "allowed", "lead", detail=f"count={len(payload.ids)} status={payload.status}")
     return {"status": "updated", "count": len(payload.ids), "new_status": payload.status}
 
 
 @app.post("/api/leads/{lead_id}/draft")
-async def update_lead_draft(lead_id: int, payload: LeadDraftUpdateRequest):
+async def update_lead_draft(lead_id: int, payload: LeadDraftUpdateRequest, request: Request):
+    actor, _workspace_id = _authorize_lead_scope(request, lead_id, action="lead.draft.update")
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="El borrador no puede quedar vacio.")
@@ -3062,12 +3430,14 @@ async def update_lead_draft(lead_id: int, payload: LeadDraftUpdateRequest):
     conn.close()
     if not changed:
         raise HTTPException(status_code=404, detail="Lead no encontrado.")
+    _audit_event("lead.draft.update", actor, actor.workspace_id, "allowed", "lead", resource_id=str(lead_id))
     return {"status": "updated", "lead_id": lead_id}
 
 
 @app.post("/api/leads/{lead_id}/regenerate-draft")
-async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftRequest):
-    if not _workspace_ai_status(payload.workspace_id).get("lead_drafts_enabled"):
+async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftRequest, request: Request):
+    actor, _workspace_id = _authorize_lead_scope(request, lead_id, action="lead.draft.regenerate")
+    if not _workspace_ai_status(actor.workspace_id).get("lead_drafts_enabled"):
         raise HTTPException(status_code=412, detail="Necesitas API keys para regenerar borradores con IA. Configúralas en API Keys.")
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
@@ -3088,6 +3458,7 @@ async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftReques
     )
     conn.commit()
     conn.close()
+    _audit_event("lead.draft.regenerate", actor, actor.workspace_id, "allowed", "lead", resource_id=str(lead_id))
     return {
         "status": "updated",
         "lead_id": lead_id,
@@ -3100,8 +3471,11 @@ async def regenerate_lead_draft(lead_id: int, payload: LeadRegenerateDraftReques
 
 
 @app.post("/api/messages/preview")
-async def preview_messages(payload: MessageStudioRequest):
-    if not _workspace_ai_status(payload.workspace_id).get("message_studio_enabled"):
+async def preview_messages(payload: MessageStudioRequest, request: Request):
+    actor = _authorize_lead_ids_scope(request, payload.ids, action="message.preview")
+    if payload.workspace_id is not None and int(payload.workspace_id) != actor.workspace_id:
+        raise HTTPException(status_code=403, detail="No estás autorizado para preparar mensajes en otro workspace.")
+    if not _workspace_ai_status(actor.workspace_id).get("message_studio_enabled"):
         raise HTTPException(status_code=412, detail="Necesitas API keys para generar mensajes con IA. Configúralas en API Keys.")
     if not payload.ids:
         raise HTTPException(status_code=400, detail="Debes seleccionar al menos un lead.")
@@ -3119,7 +3493,7 @@ async def preview_messages(payload: MessageStudioRequest):
     placeholders = ",".join("?" for _ in payload.ids)
     cursor.execute(
         f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
-        [payload.workspace_id, *payload.ids],
+        [actor.workspace_id, *payload.ids],
     )
     rows = [dict(row) for row in cursor.fetchall()]
 
@@ -3144,12 +3518,16 @@ async def preview_messages(payload: MessageStudioRequest):
 
     conn.commit()
     conn.close()
+    _audit_event("message.preview", actor, actor.workspace_id, "allowed", "lead", detail=f"count={len(previews)}")
     return {"count": len(previews), "previews": previews}
 
 
 @app.post("/api/messages/queue")
-async def queue_messages(payload: MessageQueueRequest):
-    if not _workspace_ai_status(payload.workspace_id).get("message_studio_enabled"):
+async def queue_messages(payload: MessageQueueRequest, request: Request):
+    actor = _authorize_lead_ids_scope(request, payload.ids, action="message.queue")
+    if payload.workspace_id != actor.workspace_id:
+        raise HTTPException(status_code=403, detail="No estás autorizado para encolar mensajes en otro workspace.")
+    if not _workspace_ai_status(actor.workspace_id).get("message_studio_enabled"):
         raise HTTPException(status_code=412, detail="Necesitas API keys para actualizar borradores con IA. Configúralas en API Keys.")
     if not payload.ids:
         raise HTTPException(status_code=400, detail="Debes seleccionar al menos un lead.")
@@ -3167,7 +3545,7 @@ async def queue_messages(payload: MessageQueueRequest):
     placeholders = ",".join("?" for _ in payload.ids)
     cursor.execute(
         f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
-        [payload.workspace_id, *payload.ids],
+        [actor.workspace_id, *payload.ids],
     )
     rows = [dict(row) for row in cursor.fetchall()]
     if not rows:
@@ -3177,7 +3555,7 @@ async def queue_messages(payload: MessageQueueRequest):
     job_id = str(uuid4())
     job = {
         "id": job_id,
-        "workspace_id": int(payload.workspace_id),
+        "workspace_id": actor.workspace_id,
         "status": "queued",
         "progress": 0,
         "campaign_id": payload.campaign_id,
@@ -3196,7 +3574,7 @@ async def queue_messages(payload: MessageQueueRequest):
     follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
     for idx, lead in enumerate(rows, start=1):
         studio_payload = MessageStudioRequest(
-            workspace_id=payload.workspace_id,
+            workspace_id=actor.workspace_id,
             ids=[lead["id"]],
             prompt=payload.prompt,
             prompt_first_contact=payload.prompt_first_contact,
@@ -3244,16 +3622,20 @@ async def queue_messages(payload: MessageQueueRequest):
     job["status"] = "completed"
     job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
     _persist_message_job(job)
+    _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
     return {"status": "queued", "job": _serialize_message_job(job)}
 
 
 @app.post("/api/messages/run")
-async def run_message_queue(payload: MessageRunRequest):
+async def run_message_queue(payload: MessageRunRequest, request: Request):
+    actor = _require_actor(request)
+    if payload.workspace_id != actor.workspace_id:
+        _audit_event("message.run", actor, actor.workspace_id, "denied", "workspace", resource_id=str(payload.workspace_id), detail="cross-workspace run request")
+        raise HTTPException(status_code=403, detail="No estás autorizado para ejecutar outreach en otro workspace.")
     if not payload.account_id:
         raise HTTPException(status_code=400, detail="Selecciona una cuenta emisora antes de enviar mensajes.")
-    account = _get_account(payload.account_id)
-    if not account:
-        raise HTTPException(status_code=404, detail="Cuenta emisora no encontrada.")
+    _authorize_lead_ids_scope(request, payload.ids, action="message.run")
+    _actor_for_account, account = _authorize_account_scope(request, payload.account_id, action="message.run")
     if _requires_account_warmup(account):
         raise HTTPException(status_code=409, detail="La cuenta aun necesita calentamiento de cuenta antes de hacer outreach.")
     if _requires_session_warmup(account) and not payload.override_cold_session:
@@ -3265,7 +3647,7 @@ async def run_message_queue(payload: MessageRunRequest):
     cursor = conn.cursor()
     params: List[Any] = []
     query = "SELECT id FROM leads WHERE workspace_id = ? AND status IN ('Listo para contactar', 'Primer contacto', 'Follow-up 1')"
-    params.append(payload.workspace_id)
+    params.append(actor.workspace_id)
     if payload.ids:
         placeholders = ",".join("?" for _ in payload.ids)
         query += f" AND id IN ({placeholders})"
@@ -3304,7 +3686,7 @@ async def run_message_queue(payload: MessageRunRequest):
     eta_seconds = max(60, int((eta_min_seconds + eta_max_seconds) / 2))
     job = {
         "id": job_id,
-        "workspace_id": int(payload.workspace_id),
+        "workspace_id": actor.workspace_id,
         "kind": "outreach",
         "status": "queued",
         "progress": 0,
@@ -3324,11 +3706,19 @@ async def run_message_queue(payload: MessageRunRequest):
     MESSAGE_JOB_STORE[job_id] = job
     _persist_message_job(job)
     asyncio.create_task(_run_message_outreach_job(job_id, lead_ids, payload.dry_run, payload.campaign_id))
+    _audit_event("message.run", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
     return {"status": "started", "job": _serialize_message_job(job)}
 
 
 @app.get("/api/messages/jobs")
-async def get_message_jobs(workspace_id: int):
+async def get_message_jobs(workspace_id: int, request: Request):
+    _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="message.jobs.read",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
     jobs = sorted(_workspace_jobs(workspace_id), key=lambda job: job["created_at"], reverse=True)
     return {"jobs": [_serialize_message_job(job) for job in jobs[:20]]}
 

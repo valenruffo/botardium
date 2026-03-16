@@ -1,9 +1,15 @@
 """
 Botardium Core — Outreach Manager
-==================================
+=================================
 Orquestador maestro de DMs. Lee leads pendientes de la DB,
 respeta los limites diarios (Account DNA), hace batching (bloques de 5)
 y delega la humanizacion a human_interactor.
+
+**FASE 4: Integracion con job_runtime para durabilidad e idempotencia**
+- Cada ejecución de outreach crea un JobRecord en SQLite
+- Usa idempotency_key para evitar ejecución duplicada
+- Lease-based locking para recovery ante crashes
+- Progress checkpoints para resumabilidad
 
 Consultas: directivas/memoria_maestra.md
            .tmp/account_profile.json
@@ -16,8 +22,10 @@ import random
 import re
 import time
 import sys
+import uuid
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, Any, Optional
 from scripts.runtime_paths import AGENTS_DIR, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
 
 PROJECT_ROOT = SOURCE_ROOT
@@ -26,12 +34,19 @@ sys.path.insert(0, str(AGENTS_DIR))
 
 EMERGENCY_FLAG = TMP_DIR / "emergency_stop.flag"
 
-# Imports del Core
 from scripts.session_manager import load_or_create_session
 from skills.db_manager import DatabaseManager
 from skills.human_interactor import type_like_human, random_scroll
 from skills.stealth_mod import add_behavior_noise
 from scripts.core_warmer import run_warmeo, _capitalize_to_memoria
+from scripts.job_runtime import (
+    JobRuntime,
+    JobStatus,
+    JobType,
+    JobContext,
+    get_job_runtime,
+    managed_job,
+)
 
 logger = logging.getLogger("primebot.outreach")
 
@@ -241,7 +256,86 @@ async def run_outreach(
     lead_ids: list[int] | None = None,
     limit_override: int | None = None,
     progress_hook=None,
+    job_id: str | None = None,
+    worker_id: str | None = None,
 ):
+    """
+    Ejecuta el flujo principal de Outreach (Mensajeria).
+    
+    FASE 4: Integracion con job_runtime para durabilidad e idempotencia.
+    Si se proporciona job_id, el job sera gestionado por el sistema de jobs:
+    - Crea un JobRecord en SQLite con lease-based locking
+    - Usa idempotency_key para evitar ejecuciones duplicadas
+    - Progress checkpoints para resumabilidad
+    - Recovery automatico de jobs huerfanos
+    
+    Args:
+        job_id: ID del job en job_runtime. Si se proporciona, se gestiona el lifecycle.
+        worker_id: ID del worker que ejecuta el job. Default: generated uuid.
+    """
+    runtime = get_job_runtime()
+    job_record = None
+    workspace_id = 1
+    
+    if job_id:
+        worker_id = worker_id or f"outreach_worker_{uuid.uuid4().hex[:8]}"
+        job_runtime = runtime
+        
+        idempotency_key = runtime.generate_idempotency_key(
+            "outreach",
+            str(workspace_id),
+            str(sorted(lead_ids)) if lead_ids else "all_pending",
+            datetime.now().date().isoformat()
+        )
+        
+        job_record = runtime.create_job(
+            job_id=job_id,
+            job_type=JobType.MESSAGE_OUTREACH.value,
+            workspace_id=workspace_id,
+            payload={
+                "lead_ids": lead_ids,
+                "limit_override": limit_override,
+                "dry_run": dry_run,
+            },
+            idempotency_key=idempotency_key,
+        )
+        
+        if job_record and job_record.status == JobStatus.COMPLETED.value:
+            logger.info(f"Job {job_id} ya completado anteriormente (idempotency hit)")
+            return {"sent": 0, "processed": 0, "errors": 0, "job_status": "completed", "result": json.loads(job_record.result or "{}")}
+        
+        try:
+            with managed_job(job_id, worker_id, job_runtime) as ctx:
+                result = await _run_outreach_impl(
+                    dry_run=dry_run,
+                    lead_ids=lead_ids,
+                    limit_override=limit_override,
+                    progress_hook=progress_hook,
+                    ctx=ctx,
+                )
+                ctx.complete(result)
+                return {**result, "job_status": "completed"}
+        except Exception as e:
+            if job_runtime.get_job(job_id):
+                job_runtime.fail_job(job_id, str(e))
+            raise
+    else:
+        return await _run_outreach_impl(
+            dry_run=dry_run,
+            lead_ids=lead_ids,
+            limit_override=limit_override,
+            progress_hook=progress_hook,
+            ctx=None,
+        )
+
+
+async def _run_outreach_impl(
+    dry_run: bool = False,
+    lead_ids: list[int] | None = None,
+    limit_override: int | None = None,
+    progress_hook=None,
+    ctx=None,
+) -> Dict[str, Any]:
     """
     Ejecuta el flujo principal de Outreach (Mensajeria).
     """
@@ -332,15 +426,23 @@ async def run_outreach(
             max_per_lead = max(min_per_lead + 15, min(3600, observed_max))
         return remaining * min_per_lead, remaining * max_per_lead
 
+    def _update_job_progress(current: int, total: int, current_lead: str):
+        if ctx:
+            progress = current / max(total, 1)
+            checkpoint = f"lead_{current}:{current_lead}"
+            ctx.update_progress(progress, checkpoint)
+    
     try:
         # BATCHING: Procesar en bloques definidos por perfil
         for i, lead in enumerate(leads):
             if EMERGENCY_FLAG.exists():
                 logger.error("🚨 EMERGENCY STOP ACTIVADO. Abortando loop de mensajería inmediatamente.")
+                _update_job_progress(i, len(leads), "EMERGENCY_STOP")
                 break
 
             username = lead['ig_username']
             logger.info(f"\n--- [DM {i+1}/{len(leads)}] Target: @{username} ---")
+            _update_job_progress(i, len(leads), username)
             if progress_hook:
                 eta_min, eta_max = _estimate_eta_range(i, len(leads))
                 await progress_hook({

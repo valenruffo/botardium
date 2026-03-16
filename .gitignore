@@ -1,34 +1,28 @@
-# === Secretos ===
+# === Secretos (NUNCA SUBIR) ===
 .env
 .env.*
 !.env.example
 
-# === Datos Intermedios ===
+# === Datos de Desarrollo ===
 .tmp/
 .atl/
 .agents/sessions/
+config/runtime_secrets.json
 database/*.db
-*.spec
+
+# === Logs y Temporales ===
 *.log
-*.tsbuildinfo
+*.spec
 
 # === Python ===
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
 *.egg-info/
 dist/
 build/
 venv/
 .venv/
-
-# === Node ===
-node_modules/
-botardium-panel/web/src-tauri/binaries/
-
-# === Git internos de skills ===
-skills/**/.git/
 
 # === IDE ===
 .vscode/

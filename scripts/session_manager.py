@@ -23,8 +23,8 @@ import shutil
 import time
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv
-from scripts.runtime_paths import ENV_EXAMPLE_PATH, ENV_PATH, PROFILE_PATH, SESSIONS_DIR, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
+from scripts.runtime_config import load_bootstrap_env
+from scripts.runtime_paths import PROFILE_PATH, SESSIONS_DIR, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
 
 # Paths
 PROJECT_ROOT = SOURCE_ROOT
@@ -37,11 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("primebot.session")
 
-# Load .env
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
-else:
-    load_dotenv(ENV_EXAMPLE_PATH)
+load_bootstrap_env()
 
 # Add skill directory to path for imports
 sys.path.insert(0, str(SKILLS_DIR))

@@ -1,11 +1,11 @@
 """
 PrimeBot Core — Database Manager
-==================================
+=================================
 Gestiona la persistencia local de leads y campañas (SQLite).
 Provee una interfaz limpia para que los scrapers inserten y
 los messengers consuman.
 
-Ruta: database/botardium.db
+Ruta: Uses runtime_paths.DB_PATH as authoritative source.
 """
 
 import os
@@ -15,23 +15,18 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
 
+from scripts.runtime_paths import DB_PATH, DB_DIR, ensure_runtime_dirs, create_rollback_snapshot
+
 logger = logging.getLogger("botardium.db")
 
-# Paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DB_DIR = PROJECT_ROOT / "database"
-LEGACY_DB_PATH = DB_DIR / "primebot.db"
-DB_PATH = DB_DIR / "botardium.db"
-
-if LEGACY_DB_PATH.exists() and not DB_PATH.exists():
-    LEGACY_DB_PATH.replace(DB_PATH)
+ensure_runtime_dirs()
 
 
 class DatabaseManager:
     """Gestor de base de datos local SQLite para PrimeBot."""
 
-    def __init__(self, db_path: Path = DB_PATH):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path if db_path is not None else DB_PATH
         self.workspace_id = int(os.getenv("BOTARDIUM_WORKSPACE_ID") or "0") or None
         self._ensure_dir()
         self.init_db()

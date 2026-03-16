@@ -18,10 +18,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from scripts.runtime_paths import TMP_DIR, SOURCE_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-STATUS_FILE = PROJECT_ROOT / ".tmp" / "scraper_status.json"
-REPORT_FILE = PROJECT_ROOT / ".tmp" / "hashtag_smoke_report.json"
+STATUS_FILE = TMP_DIR / "scraper_status.json"
+REPORT_FILE = TMP_DIR / "hashtag_smoke_report.json"
+PROJECT_ROOT = SOURCE_ROOT
 
 
 def _run_hashtag(query: str, limit: int, timeout: int) -> dict[str, Any]:

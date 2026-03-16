@@ -25,6 +25,7 @@ import random
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict
+from scripts.runtime_config import load_bootstrap_env
 from scripts.runtime_paths import PROFILE_PATH, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
 
 # Paths
@@ -47,6 +48,7 @@ except Exception:
     google_genai_types = None
 
 logger = logging.getLogger("primebot.scraper")
+load_bootstrap_env()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
 GEMINI_NICHE_CACHE: dict[str, tuple[bool, str]] = {}
 

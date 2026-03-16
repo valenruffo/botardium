@@ -4,9 +4,9 @@ import sys
 import time
 from pathlib import Path
 
+from scripts.runtime_paths import LOG_DIR, SOURCE_ROOT, TMP_DIR
 
-ROOT = Path(__file__).resolve().parent.parent
-LOG_DIR = ROOT / ".tmp" / "logs"
+ROOT = SOURCE_ROOT
 WEB_DIR = ROOT / "botardium-panel" / "web"
 
 

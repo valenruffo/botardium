@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MagicBox } from "@/components/magic-box";
-import { apiUrl } from "@/lib/api";
+import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
 import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck } from "lucide-react";
 
 declare const __APP_VERSION__: string;
@@ -19,7 +19,14 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
-const fetcher = (url: string) => fetch(url).then((res) => res.json());
+const fetcher = async (url: string) => {
+  const res = await apiFetch(url);
+  if (!res.ok) {
+    const detail = await res.text();
+    throw new Error(detail || `API error ${res.status}`);
+  }
+  return res.json();
+};
 
 const DEFAULT_MASTER_PROMPT = 'Mantén un tono profesional y humano para Instagram DM B2B. Prioriza claridad, cercanía y una CTA suave; evita frases agresivas o robóticas.';
 const BRAND_LOGO_SRC = './logo.png';
@@ -490,7 +497,6 @@ type UpdateStatus = {
 };
 
 export default function Dashboard() {
-  const AUTH_STORAGE_KEY = 'botardium-auth';
   const [currentRoute, setCurrentRoute] = useState<'auth' | 'register' | 'accounts' | 'app'>('auth');
   const [currentView, setCurrentView] = useState<'dashboard' | 'crm' | 'campaigns' | 'message_studio' | 'guide' | 'api_keys' | 'admin_accounts'>('dashboard');
 
@@ -551,6 +557,33 @@ export default function Dashboard() {
   const openApiKeys = () => {
     setCurrentRoute('app');
     setCurrentView('api_keys');
+  };
+  const applySession = (session: StoredSession) => {
+    setStoredSession(session);
+    setCurrentUserId(session.workspace_id);
+    setCurrentUserEmail(session.workspace_name);
+    setCurrentRoute('accounts');
+  };
+
+  const closeSession = () => {
+    setCurrentUserId(null);
+    setCurrentUserEmail('');
+    clearStoredSession();
+    setCurrentRoute('auth');
+  };
+
+  const loginToWorkspace = async (workspaceId: number, fallbackName?: string) => {
+    const res = await apiFetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data?.auth?.token) {
+      throw new Error(data.detail || 'No pude abrir la sesión local del workspace.');
+    }
+    applySession(data.auth as StoredSession);
+    toast.success(`Workspace ${(data.auth?.workspace_name || fallbackName || 'local')} cargado.`);
   };
 
   // Data Fetching
@@ -633,7 +666,7 @@ export default function Dashboard() {
       const endpoint = action === 'start'
         ? apiUrl(`/api/accounts/${accountId}/warmup`)
         : apiUrl(`/api/accounts/${accountId}/warmup-cancel`);
-      const res = await fetch(endpoint, {
+      const res = await apiFetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: action === 'start' ? JSON.stringify({ duration_min: durationMin }) : undefined,
@@ -692,7 +725,7 @@ export default function Dashboard() {
     setIsLoggingIn(true);
     toast.loading('Iniciando navegador seguro. Por favor, inicia sesión en Instagram...', { id: 'login-ig' });
     try {
-      const res = await fetch(apiUrl('/api/ig/login'), {
+      const res = await apiFetch(apiUrl('/api/ig/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workspace_id: currentUserId })
@@ -740,7 +773,7 @@ export default function Dashboard() {
     if (!currentUserId) return;
     try {
       setIsSavingAiKeys(true);
-      const res = await fetch(apiUrl(`/api/workspaces/${currentUserId}/ai-settings`), {
+      const res = await apiFetch(apiUrl(`/api/workspaces/${currentUserId}/ai-settings`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -796,7 +829,7 @@ export default function Dashboard() {
     if (!currentUserId) return;
     try {
       setIsExportingWorkspace(true);
-      const res = await fetch(apiUrl(`/api/workspaces/${currentUserId}/export`), { method: 'POST' });
+      const res = await apiFetch(apiUrl(`/api/workspaces/${currentUserId}/export`), { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         toast.error(data.detail || 'No pude exportar el workspace.');
@@ -819,7 +852,7 @@ export default function Dashboard() {
         filters: [{ name: 'Workspace export', extensions: ['zip'] }],
       });
       if (!selected || Array.isArray(selected)) return;
-      const res = await fetch(apiUrl('/api/workspaces/import'), {
+      const res = await apiFetch(apiUrl('/api/workspaces/import'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ zip_path: selected }),
@@ -830,10 +863,9 @@ export default function Dashboard() {
         return;
       }
       await mutateWorkspaces();
-      setCurrentUserId(data.workspace_id);
-      setCurrentUserEmail(data.name);
-      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ userId: data.workspace_id, email: data.name }));
-      setCurrentRoute('accounts');
+      if (data.auth?.token) {
+        applySession(data.auth as StoredSession);
+      }
       toast.success(`Workspace ${data.name} importado correctamente.`);
     } catch {
       toast.error('Error importando el workspace.');
@@ -851,7 +883,7 @@ export default function Dashboard() {
     try {
       setIsReloggingAccount(true);
       toast.info('Abriendo navegador para re-login manual de la cuenta.');
-      const res = await fetch(apiUrl(`/api/accounts/${activeAccount.id}/relogin`), { method: 'POST' });
+      const res = await apiFetch(apiUrl(`/api/accounts/${activeAccount.id}/relogin`), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         toast.error(data.detail || 'No pude revalidar la sesión de la cuenta.');
@@ -895,7 +927,7 @@ export default function Dashboard() {
 
   const updateAccountType = async (accountId: number, accountType: 'mature' | 'new' | 'rehab') => {
     try {
-      const res = await fetch(apiUrl(`/api/accounts/${accountId}/profile`), {
+      const res = await apiFetch(apiUrl(`/api/accounts/${accountId}/profile`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ account_type: accountType }),
@@ -914,7 +946,7 @@ export default function Dashboard() {
 
   const completeAccountWarmupDay = async (accountId: number) => {
     try {
-      const res = await fetch(apiUrl(`/api/accounts/${accountId}/account-warmup-day`), { method: 'POST' });
+      const res = await apiFetch(apiUrl(`/api/accounts/${accountId}/account-warmup-day`), { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         toast.error(data.detail || 'No pude registrar el avance de calentamiento.');
@@ -960,7 +992,7 @@ export default function Dashboard() {
 
   const campaignAction = async (campaignId: string, action: 'start_warmup' | 'finish_warmup' | 'start_scraping' | 'pause' | 'delete') => {
     try {
-      const res = await fetch(apiUrl(`/api/bot/${campaignId}/action`), {
+      const res = await apiFetch(apiUrl(`/api/bot/${campaignId}/action`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -986,7 +1018,7 @@ export default function Dashboard() {
       return;
     }
     try {
-      const res = await fetch(apiUrl(`/api/bot/${campaignId}/action`), {
+      const res = await apiFetch(apiUrl(`/api/bot/${campaignId}/action`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'rename', campaign_name: nextName }),
@@ -1007,18 +1039,19 @@ export default function Dashboard() {
 
   // Sonner Hook on new leads
   useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as { userId?: number; email?: string };
-      if (parsed.userId && parsed.email) {
-        setCurrentUserId(parsed.userId);
-        setCurrentUserEmail(parsed.email);
-        setCurrentRoute('accounts');
-      }
-    } catch {
-      window.localStorage.removeItem(AUTH_STORAGE_KEY);
-    }
+    const session = getStoredSession();
+    if (!session) return;
+    applySession(session);
+    apiFetch('/api/auth/session')
+      .then(async (res) => {
+        if (!res.ok) throw new Error('invalid-session');
+        const data = await res.json();
+        if (!data?.workspace_id) throw new Error('invalid-session');
+      })
+      .catch(() => {
+        closeSession();
+        toast.info('La sesión local expiró. Vuelve a abrir tu workspace.');
+      });
   }, []);
 
   useEffect(() => {
@@ -1210,7 +1243,7 @@ export default function Dashboard() {
     try {
       const ids = all ? [] : selectedLeadIds;
       const endpoint = action === 'delete' ? 'bulk-delete' : 'bulk-status';
-      const res = await fetch(apiUrl(`/api/leads/${endpoint}`), {
+      const res = await apiFetch(apiUrl(`/api/leads/${endpoint}`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids, status }),
@@ -1230,7 +1263,7 @@ export default function Dashboard() {
 
   const updateSingleLeadStatus = async (leadId: number, status: string, username?: string) => {
     try {
-      const res = await fetch(apiUrl('/api/leads/bulk-status'), {
+      const res = await apiFetch(apiUrl('/api/leads/bulk-status'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids: [leadId], status }),
@@ -1261,7 +1294,7 @@ export default function Dashboard() {
     try {
       setIsPreparingDrafts(true);
       setDraftProgressLabel(`Analizando ${ids.length} lead(s) y generando borradores con IA...`);
-      const res = await fetch(apiUrl('/api/messages/preview'), {
+      const res = await apiFetch(apiUrl('/api/messages/preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1305,7 +1338,7 @@ export default function Dashboard() {
     try {
       setIsSavingDrafts(true);
       setDraftProgressLabel(`Guardando ${ids.length} borradores en el CRM...`);
-      const res = await fetch(apiUrl('/api/messages/queue'), {
+      const res = await apiFetch(apiUrl('/api/messages/queue'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1384,7 +1417,7 @@ export default function Dashboard() {
   const executeOutreachSend = async (overrideColdSession: boolean, targetIds?: number[]) => {
     if (!activeAccount) return;
     try {
-      const res = await fetch(apiUrl('/api/messages/run'), {
+      const res = await apiFetch(apiUrl('/api/messages/run'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1426,7 +1459,7 @@ export default function Dashboard() {
   const saveLeadDraft = async () => {
     if (!selectedLeadDraft?.id) return;
     try {
-      const res = await fetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/draft`), {
+      const res = await apiFetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/draft`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: leadDraftText }),
@@ -1448,7 +1481,7 @@ export default function Dashboard() {
     if (!selectedLeadDraft?.id) return;
     if (!requireAiFeature(hasAiForMessages)) return;
     try {
-      const res = await fetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/regenerate-draft`), {
+      const res = await apiFetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/regenerate-draft`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1502,11 +1535,10 @@ export default function Dashboard() {
                     key={workspace.id}
                     type="button"
                     onClick={() => {
-                      setCurrentUserId(workspace.id);
-                      setCurrentUserEmail(workspace.name);
-                      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ userId: workspace.id, email: workspace.name }));
-                      setCurrentRoute('accounts');
-                      toast.success(`Workspace ${workspace.name} cargado.`);
+                      void loginToWorkspace(workspace.id, workspace.name).catch((error) => {
+                        const message = error instanceof Error ? error.message : 'No pude abrir el workspace.';
+                        toast.error(message);
+                      });
                     }}
                     className="w-full rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-left transition-colors hover:border-cyan-500/40 hover:bg-slate-800"
                   >
@@ -1520,7 +1552,7 @@ export default function Dashboard() {
             <form onSubmit={async (e) => {
               e.preventDefault();
               try {
-                const res = await fetch(apiUrl('/api/workspaces'), {
+                const res = await apiFetch(apiUrl('/api/workspaces'), {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ name: newWorkspaceName }),
@@ -1531,11 +1563,10 @@ export default function Dashboard() {
                   return;
                 }
                 await mutateWorkspaces();
-                setCurrentUserId(data.workspace_id);
-                setCurrentUserEmail(data.name);
-                window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ userId: data.workspace_id, email: data.name }));
+                if (data.auth?.token) {
+                  applySession(data.auth as StoredSession);
+                }
                 setNewWorkspaceName('');
-                setCurrentRoute('accounts');
                 toast.success(`Workspace ${data.name} creado en tu computadora.`);
               } catch {
                 toast.error('Error creando el workspace local.');
@@ -1672,7 +1703,7 @@ export default function Dashboard() {
                           onClick={async () => {
                             if (confirm(`¿Estás seguro que deseas desconectar la cuenta @${acc.ig_username} del sistema?`)) {
                               try {
-                                const res = await fetch(apiUrl(`/api/accounts/${acc.id}`), { method: 'DELETE' });
+                                const res = await apiFetch(apiUrl(`/api/accounts/${acc.id}`), { method: 'DELETE' });
                                 if (res.ok) {
                                   mutateAccounts();
                                   toast.success(`Cuenta @${acc.ig_username} eliminada del pool.`);
@@ -1791,10 +1822,7 @@ export default function Dashboard() {
               </DropdownMenuItem>
               <DropdownMenuSeparator className="bg-slate-800" />
               <DropdownMenuItem onClick={() => {
-                setCurrentUserId(null);
-                setCurrentUserEmail("");
-                window.localStorage.removeItem(AUTH_STORAGE_KEY);
-                setCurrentRoute('auth');
+                closeSession();
                 toast.info("Workspace cerrado. Tus datos locales siguen guardados en esta PC.");
               }} className="focus:bg-slate-800 focus:text-white cursor-pointer text-rose-400">
                 <LogOut className="mr-2 h-4 w-4" /> Cerrar Sesión Segura
@@ -2147,7 +2175,7 @@ export default function Dashboard() {
                           return;
                         }
                         try {
-                          const res = await fetch(apiUrl('/api/bot/start'), {
+                          const res = await apiFetch(apiUrl('/api/bot/start'), {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -2663,7 +2691,7 @@ export default function Dashboard() {
                                       <DropdownMenuItem
                                         onClick={async () => {
                                           try {
-                                            const res = await fetch(apiUrl(`/api/leads/${lead.id}`), { method: 'DELETE' });
+                                            const res = await apiFetch(apiUrl(`/api/leads/${lead.id}`), { method: 'DELETE' });
                                             if (!res.ok) {
                                               const data = await res.json();
                                               toast.error(data.detail || 'No pude eliminar el lead.');

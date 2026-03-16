@@ -23,8 +23,8 @@ import time
 import logging
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv
-from scripts.runtime_paths import AGENTS_DIR, ENV_EXAMPLE_PATH, ENV_PATH, MEMORIA_PATH, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
+from scripts.runtime_config import load_bootstrap_env
+from scripts.runtime_paths import AGENTS_DIR, MEMORIA_PATH, PROFILE_PATH, SOURCE_ROOT, TMP_DIR
 
 # Paths
 PROJECT_ROOT = SOURCE_ROOT
@@ -37,11 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("primebot.warmer")
 
-# Load .env
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
-else:
-    load_dotenv(ENV_EXAMPLE_PATH)
+load_bootstrap_env()
 
 # Ensure project imports (scripts.*) resolve when executed as script
 sys.path.insert(0, str(PROJECT_ROOT))
