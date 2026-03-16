@@ -1954,16 +1954,19 @@ export default function Dashboard() {
                           size="md"
                           className="w-full"
                         />
-                        <button onClick={() => setCurrentRoute('app')} className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition-all hover:from-cyan-400 hover:to-emerald-400">
-                          Usar esta cuenta
-                        </button>
-                        <button onClick={() => reloginAccount(acc)} disabled={isReloggingAccount} className="w-full flex items-center justify-center gap-2 rounded-xl bg-indigo-500/15 border border-indigo-500/20 px-4 py-2 text-sm font-medium text-indigo-300 hover:bg-indigo-500/25 transition-colors disabled:opacity-50">
-                          {isReloggingAccount ? (
-                            <><span className="w-4 h-4 rounded-full border-2 border-indigo-300/30 border-t-indigo-300 animate-spin" /> Conectando...</>
-                          ) : (
-                            <><LogIn className="w-4 h-4" /> Re-loguear Sesión</>
-                          )}
-                        </button>
+                        {acc.session_status === 'verified' ? (
+                          <button onClick={() => setCurrentRoute('app')} className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition-all hover:from-cyan-400 hover:to-emerald-400">
+                            Usar esta cuenta
+                          </button>
+                        ) : (
+                          <button onClick={() => reloginAccount(acc)} disabled={isReloggingAccount} className="w-full flex items-center justify-center gap-2 rounded-xl bg-rose-500 hover:bg-rose-400 px-4 py-2 text-sm font-bold text-white transition-colors disabled:opacity-50 animate-pulse-slow">
+                            {isReloggingAccount ? (
+                              <><span className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /> Conectando...</>
+                            ) : (
+                              <><LogIn className="w-4 h-4" /> Re-loguear Sesión (Obligatorio)</>
+                            )}
+                          </button>
+                        )}
                         {acc.requires_account_warmup && (
                           <button onClick={() => completeAccountWarmupDay(acc.id)} className="w-full rounded-xl bg-rose-500/15 px-4 py-2 text-sm font-medium text-rose-200 hover:bg-rose-500/25">
                             Registrar día de calentamiento
