@@ -6,7 +6,7 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MagicBox } from "@/components/magic-box";
 import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
-import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2 } from "lucide-react";
+import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, LogIn, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2 } from "lucide-react";
 
 declare const __APP_VERSION__: string;
 import { Badge } from "@/components/ui/badge";
@@ -1050,29 +1050,33 @@ export default function Dashboard() {
     }
   };
 
-  const reloginActiveAccount = async () => {
-    if (!activeAccount) {
-      toast.error('Primero selecciona o conecta una cuenta emisora.');
-      return;
-    }
+  const reloginAccount = async (account: IgAccount) => {
     if (isReloggingAccount) return;
     try {
       setIsReloggingAccount(true);
       toast.info('Abriendo navegador para re-login manual de la cuenta.');
-      const res = await apiFetch(apiUrl(`/api/accounts/${activeAccount.id}/relogin`), { method: 'POST' });
+      const res = await apiFetch(apiUrl(`/api/accounts/${account.id}/relogin`), { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         toast.error(data.detail || 'No pude revalidar la sesión de la cuenta.');
         return;
       }
       await mutateAccounts();
-      toast.success(`Sesión revalidada para @${activeAccount.ig_username}.`);
+      toast.success(`Sesión revalidada para @${account.ig_username}.`);
     } catch (error) {
       const reason = error instanceof Error ? error.message : 'Error en re-login de la cuenta.';
       toast.error(reason);
     } finally {
       setIsReloggingAccount(false);
     }
+  };
+
+  const reloginActiveAccount = () => {
+    if (!activeAccount) {
+      toast.error('Primero selecciona o conecta una cuenta emisora.');
+      return;
+    }
+    return reloginAccount(activeAccount);
   };
 
   const sendSingleLead = async (lead?: Lead) => {
@@ -1952,6 +1956,13 @@ export default function Dashboard() {
                         />
                         <button onClick={() => setCurrentRoute('app')} className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition-all hover:from-cyan-400 hover:to-emerald-400">
                           Usar esta cuenta
+                        </button>
+                        <button onClick={() => reloginAccount(acc)} disabled={isReloggingAccount} className="w-full flex items-center justify-center gap-2 rounded-xl bg-indigo-500/15 border border-indigo-500/20 px-4 py-2 text-sm font-medium text-indigo-300 hover:bg-indigo-500/25 transition-colors disabled:opacity-50">
+                          {isReloggingAccount ? (
+                            <><span className="w-4 h-4 rounded-full border-2 border-indigo-300/30 border-t-indigo-300 animate-spin" /> Conectando...</>
+                          ) : (
+                            <><LogIn className="w-4 h-4" /> Re-loguear Sesión</>
+                          )}
                         </button>
                         {acc.requires_account_warmup && (
                           <button onClick={() => completeAccountWarmupDay(acc.id)} className="w-full rounded-xl bg-rose-500/15 px-4 py-2 text-sm font-medium text-rose-200 hover:bg-rose-500/25">
