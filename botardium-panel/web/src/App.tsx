@@ -623,6 +623,13 @@ type UpdateStatus = {
 export default function Dashboard() {
   const [currentRoute, setCurrentRoute] = useState<'auth' | 'register' | 'accounts' | 'app'>('auth');
   const [currentView, setCurrentView] = useState<'dashboard' | 'crm' | 'campaigns' | 'message_studio' | 'guide' | 'api_keys' | 'admin_accounts'>('dashboard');
+  const [isWorkspaceSessionExpired, setIsWorkspaceSessionExpired] = useState(false);
+
+  useEffect(() => {
+    const handleExpired = () => setIsWorkspaceSessionExpired(true);
+    window.addEventListener('botardium-session-expired', handleExpired);
+    return () => window.removeEventListener('botardium-session-expired', handleExpired);
+  }, []);
 
   // Auth Form State
   const [loginEmail, setLoginEmail] = useState("");
@@ -2087,6 +2094,35 @@ export default function Dashboard() {
           </DropdownMenu>
         </div>
       </header>
+
+      {isWorkspaceSessionExpired && (
+        <div className="bg-amber-500/10 border-b border-amber-500/30 p-4 flex flex-col sm:flex-row items-center justify-between gap-4 z-40 relative shadow-xl backdrop-blur-md">
+          <div className="flex items-center gap-3">
+            <ShieldAlert className="w-6 h-6 text-amber-500 animate-pulse" />
+            <div>
+              <h3 className="text-amber-400 font-bold text-sm">Tu sesión de workspace expiró</h3>
+              <p className="text-slate-300 text-xs mt-0.5">Por razones de seguridad, debes re-conectar tu workspace para continuar operando sin perder tu trabajo actual.</p>
+            </div>
+          </div>
+          <button
+            onClick={() => {
+              if (currentUserId !== null) {
+                void loginToWorkspace(currentUserId, currentUserEmail).then(() => {
+                  setIsWorkspaceSessionExpired(false);
+                }).catch((error) => {
+                  const message = error instanceof Error ? error.message : 'No pude re-conectar el workspace.';
+                  toast.error(message);
+                });
+              } else {
+                closeSession();
+              }
+            }}
+            className="whitespace-nowrap bg-amber-500 hover:bg-amber-400 text-amber-950 px-5 py-2 hidden sm:flex items-center justify-center rounded-xl text-sm font-bold shadow-lg transition-colors border border-amber-400 cursor-pointer"
+          >
+            Re-conectar Workspace
+          </button>
+        </div>
+      )}
 
       <div className="flex flex-1 min-h-0">
         {/* Sidebar */}

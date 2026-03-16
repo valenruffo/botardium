@@ -1,3 +1,5 @@
+import { toast } from "sonner";
+
 const FALLBACK_API_BASE_URL = "http://127.0.0.1:8000";
 export const AUTH_STORAGE_KEY = "botardium-auth";
 
@@ -78,6 +80,15 @@ export const apiFetch = async (input: string, init?: RequestInit): Promise<Respo
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
+
+    if (response.status === 401) {
+      clearStoredSession();
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent('botardium-session-expired'));
+      }
+      return response;
+    }
+
     return response;
   } catch (error) {
     clearTimeout(timeoutId);
