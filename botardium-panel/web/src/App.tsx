@@ -2461,6 +2461,10 @@ export default function Dashboard() {
                           toast.error('Necesitas una cuenta de Instagram conectada para lanzar la campana.');
                           return;
                         }
+                        if (activeAccount.session_status !== 'verified') {
+                          toast.error('La cuenta seleccionada no tiene una sesión activa válida. Re-conéctala desde Cuentas o verifícala antes de lanzar una campaña.');
+                          return;
+                        }
                         const cleanedSources = campaignDraft.sources.map((source) => ({ ...source, target: source.target.trim() })).filter((source) => source.target);
                         if (!cleanedSources.length) {
                           toast.error('Agrega al menos un source valido para lanzar la campana.');

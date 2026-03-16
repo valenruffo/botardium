@@ -3168,6 +3168,9 @@ async def start_bot(config: CampaignStartRequest, request: Request):
         resource_type="workspace",
         resource_id=str(config.workspace_id),
     )
+    from scripts.session_manager import session_exists
+    if not session_exists(config.username, _workspace_slug(actor.workspace_id)):
+        raise HTTPException(status_code=409, detail=f"La sesión de @{config.username} expiró o no es válida. Por favor, re-conecta la cuenta desde la pestaña Cuentas antes de lanzar la campaña.")
     normalized_sources = []
     warmup_mode = config.warmup_mode.strip().lower()
     if warmup_mode not in ALLOWED_WARMUP_MODES:
@@ -3322,6 +3325,11 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_scraping":
+        from scripts.session_manager import session_exists
+        
+        if not session_exists(campaign["username"], _workspace_slug(actor.workspace_id)):
+            raise HTTPException(status_code=409, detail=f"No hay sesión válida para @{campaign['username']}. Re-loguea la cuenta desde la pestaña Cuentas para poder ejecutar.")
+            
         task = CAMPAIGN_TASKS.get(campaign_id)
         if task and not task.done():
             raise HTTPException(status_code=400, detail="La campana ya esta ejecutandose.")
