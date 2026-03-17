@@ -1177,9 +1177,13 @@ export default function Dashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        toast.error(data.detail || 'No pude actualizar la campana.');
+        toast.error(data.detail || 'Error modificando la campana.');
+        if (res.status === 409) {
+          await mutateAccounts(); // Refresh the session_status locally so the button becomes angry red
+          setCurrentView('admin_accounts'); // Brutally kick the user back out
+        }
         return;
       }
       await mutateBotStatus();
@@ -2506,9 +2510,13 @@ export default function Dashboard() {
                               require_coherence: campaignDraft.requireCoherence,
                             }),
                           });
-                          const data = await res.json();
+                          const data = await res.json().catch(() => ({}));
                           if (!res.ok) {
                             toast.error(data.detail || 'No pude lanzar la campana.');
+                            if (res.status === 409) {
+                              await mutateAccounts();
+                              setCurrentView('admin_accounts');
+                            }
                             return;
                           }
                           await mutateBotStatus();
