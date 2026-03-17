@@ -1087,6 +1087,21 @@ def _delete_campaign(campaign_id: str) -> None:
     conn.close()
 
 
+def _mark_message_job_failed(job_id: str, error_message: str) -> None:
+    job = MESSAGE_JOB_STORE.get(job_id)
+    if not job:
+        return
+    job["status"] = "error"
+    job["current_action"] = f"Error: {error_message}"
+    job["metrics"]["errors"] = job.get("metrics", {}).get("errors", 0) + 1
+    job.setdefault("logs", []).insert(0, {
+        "message": f"Error: {error_message}",
+        "timestamp": int(time.time()),
+    })
+    job["logs"] = job["logs"][:12]
+    _persist_message_job(job)
+
+
 def _persist_message_job(job: Dict[str, Any]) -> None:
     conn = _connect_db()
     cursor = conn.cursor()
@@ -3567,12 +3582,27 @@ async def preview_messages(payload: MessageStudioRequest, request: Request):
 
 @app.post("/api/messages/queue")
 async def queue_messages(payload: MessageQueueRequest, request: Request):
+    import sys
+    log_file = Path('logs/queue_debug.log')
+    log_file.parent.mkdir(exist_ok=True)
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(f"\n=== queue_messages START @ {datetime.now().isoformat()} ===\n")
+        f.write(f"workspace_id={payload.workspace_id}, ids_count={len(payload.ids)}\n")
+        f.write(f"prompt_length={len(payload.prompt or '')}, first_contact_length={len(payload.prompt_first_contact or '')}\n")
+        f.flush()
+    
+    print(f"[DEBUG] === queue_messages START ===", file=sys.stderr)
+    print(f"[DEBUG] workspace_id={payload.workspace_id}, ids_count={len(payload.ids)}", file=sys.stderr)
+    
     actor = _authorize_lead_ids_scope(request, payload.ids, action="message.queue")
     if payload.workspace_id != actor.workspace_id:
+        print(f"[ERROR] workspace_id mismatch", file=sys.stderr)
         raise HTTPException(status_code=403, detail="No estás autorizado para encolar mensajes en otro workspace.")
     if not _workspace_ai_status(actor.workspace_id).get("message_studio_enabled"):
+        print(f"[ERROR] message_studio not enabled for workspace {actor.workspace_id}", file=sys.stderr)
         raise HTTPException(status_code=412, detail="Necesitas API keys para actualizar borradores con IA. Configúralas en API Keys.")
     if not payload.ids:
+        print(f"[ERROR] no ids provided", file=sys.stderr)
         raise HTTPException(status_code=400, detail="Debes seleccionar al menos un lead.")
     if not any([
         (payload.prompt or "").strip(),
@@ -3580,93 +3610,158 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
         (payload.prompt_follow_up_1 or "").strip(),
         (payload.prompt_follow_up_2 or "").strip(),
     ]):
+        print(f"[ERROR] no prompts provided", file=sys.stderr)
         raise HTTPException(status_code=400, detail="Debes escribir al menos un prompt para guardar borradores.")
 
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    placeholders = ",".join("?" for _ in payload.ids)
-    cursor.execute(
-        f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
-        [actor.workspace_id, *payload.ids],
-    )
-    rows = [dict(row) for row in cursor.fetchall()]
-    if not rows:
-        conn.close()
-        raise HTTPException(status_code=404, detail="No se encontraron leads para encolar.")
-
-    job_id = str(uuid4())
-    job = {
-        "id": job_id,
-        "workspace_id": actor.workspace_id,
-        "status": "queued",
-        "progress": 0,
-        "campaign_id": payload.campaign_id,
-        "prompt": payload.prompt.strip(),
-        "created_at": int(time.time()),
-        "current_action": "Preparando cola de mensajeria personalizada.",
-        "total": len(rows),
-        "processed": 0,
-        "metrics": {"generated": 0, "errors": 0},
-        "logs": [],
-    }
-    MESSAGE_JOB_STORE[job_id] = job
-    _persist_message_job(job)
-
-    now = datetime.now()
-    follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
-    for idx, lead in enumerate(rows, start=1):
-        studio_payload = MessageStudioRequest(
-            workspace_id=actor.workspace_id,
-            ids=[lead["id"]],
-            prompt=payload.prompt,
-            prompt_first_contact=payload.prompt_first_contact,
-            prompt_follow_up_1=payload.prompt_follow_up_1,
-            prompt_follow_up_2=payload.prompt_follow_up_2,
-        )
-        bundle = _bundle_for_lead_with_payload(lead, studio_payload)
-        message = bundle["message"]
+    conn = None
+    job_id = None
+    rows = []
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        placeholders = ",".join("?" for _ in payload.ids)
         cursor.execute(
-            """
-            UPDATE leads
-            SET status = ?,
-                last_message_preview = ?,
-                message_prompt = ?,
-                message_variant = ?,
-                last_message_rationale = ?,
-                sent_at = ?,
-                follow_up_due_at = ?,
-                contacted_at = ?
-            WHERE id = ?
-            """,
-            (
-                "Listo para contactar",
-                message,
-                payload.prompt.strip(),
-                bundle["variant"],
-                bundle["rationale"],
-                None,
-                datetime.fromtimestamp(follow_up_due).isoformat(),
-                None,
-                lead["id"],
-            ),
+            f"SELECT id, ig_username AS username, full_name, bio, source, campaign_id, status FROM leads WHERE workspace_id = ? AND id IN ({placeholders}) ORDER BY created_at DESC",
+            [actor.workspace_id, *payload.ids],
         )
-        job["processed"] = idx
-        job["progress"] = int((idx / len(rows)) * 100)
-        job["status"] = "running" if idx < len(rows) else "completed"
-        job["metrics"]["generated"] = idx
-        job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
-        job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
-        job["logs"] = job["logs"][:12]
+        rows = [dict(row) for row in cursor.fetchall()]
+        print(f"[DEBUG] Found {len(rows)} leads in DB")
+        for row in rows:
+            print(f"[DEBUG]   Lead: id={row['id']}, username={row['username']}, status={row['status']}, bio_len={len(row['bio'] or '')}")
+        if not rows:
+            print(f"[ERROR] no leads found in DB")
+            raise HTTPException(status_code=404, detail="No se encontraron leads para encolar.")
+
+        job_id = str(uuid4())
+        job = {
+            "id": job_id,
+            "workspace_id": actor.workspace_id,
+            "status": "queued",
+            "progress": 0,
+            "campaign_id": payload.campaign_id,
+            "prompt": payload.prompt.strip(),
+            "created_at": int(time.time()),
+            "current_action": "Preparando cola de mensajeria personalizada.",
+            "total": len(rows),
+            "processed": 0,
+            "metrics": {"generated": 0, "errors": 0},
+            "logs": [],
+        }
+        MESSAGE_JOB_STORE[job_id] = job
         _persist_message_job(job)
 
-    conn.commit()
-    conn.close()
-    job["status"] = "completed"
-    job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
-    _persist_message_job(job)
-    _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
-    return {"status": "queued", "job": _serialize_message_job(job)}
+        now = datetime.now()
+        follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
+        for idx, lead in enumerate(rows, start=1):
+            log_msg = f"Processing lead {idx}/{len(rows)} - @{lead['username']} (id={lead['id']}, status={lead['status']})"
+            print(f"[DEBUG] queue_messages: {log_msg}", file=sys.stderr)
+            with open(log_file, 'a', encoding='utf-8') as f:
+                f.write(f"{log_msg}\n")
+                f.flush()
+            try:
+                studio_payload = MessageStudioRequest(
+                    workspace_id=actor.workspace_id,
+                    ids=[lead["id"]],
+                    prompt=payload.prompt,
+                    prompt_first_contact=payload.prompt_first_contact,
+                    prompt_follow_up_1=payload.prompt_follow_up_1,
+                    prompt_follow_up_2=payload.prompt_follow_up_2,
+                )
+                bundle = _bundle_for_lead_with_payload(lead, studio_payload)
+                log_success = f"Bundle OK for @{lead['username']}: message_len={len(bundle.get('message', ''))}, variant={bundle.get('variant')}"
+                print(f"[DEBUG] {log_success}", file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{log_success}\n")
+                    f.flush()
+                message = bundle["message"]
+            except Exception as e:
+                error_msg = f"FAILED for lead {lead['id']} (@{lead['username']}): {e}"
+                print(f"[ERROR] queue_messages: {error_msg}", file=sys.stderr)
+                import traceback
+                tb = traceback.format_exc()
+                print(tb, file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"ERROR: {error_msg}\n")
+                    f.write(f"TRACEBACK: {tb}\n")
+                    f.flush()
+                _mark_message_job_failed(job_id, f"Error generando mensaje para @{lead['username']}")
+                raise HTTPException(status_code=500, detail=f"Error generando mensaje para @{lead['username']}: {str(e)}")
+            try:
+                cursor.execute(
+                    """
+                    UPDATE leads
+                    SET status = ?,
+                        last_message_preview = ?,
+                        message_prompt = ?,
+                        message_variant = ?,
+                        last_message_rationale = ?,
+                        sent_at = ?,
+                        follow_up_due_at = ?,
+                        contacted_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "Listo para contactar",
+                        message,
+                        payload.prompt.strip(),
+                        bundle["variant"],
+                        bundle["rationale"],
+                        None,
+                        datetime.fromtimestamp(follow_up_due).isoformat(),
+                        None,
+                        lead["id"],
+                    ),
+                )
+                log_update = f"DB UPDATE OK for @{lead['username']}"
+                print(f"[DEBUG] {log_update}", file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{log_update}\n")
+                    f.flush()
+            except Exception as db_err:
+                log_db_err = f"DB UPDATE FAILED for @{lead['username']}: {db_err}"
+                print(f"[ERROR] {log_db_err}", file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{log_db_err}\n")
+                    f.flush()
+                _mark_message_job_failed(job_id, f"Error guardando mensaje en DB para @{lead['username']}")
+                raise HTTPException(status_code=500, detail=f"Error guardando mensaje en DB: {str(db_err)}")
+            try:
+                job["processed"] = idx
+                job["progress"] = int((idx / len(rows)) * 100)
+                job["status"] = "running" if idx < len(rows) else "completed"
+                job["metrics"]["generated"] = idx
+                job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
+                job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
+                job["logs"] = job["logs"][:12]
+                _persist_message_job(job)
+                log_job = f"Job persistido OK para @{lead['username']}"
+                print(f"[DEBUG] {log_job}", file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{log_job}\n")
+                    f.flush()
+            except Exception as job_err:
+                log_job_err = f"JOB PERSIST FAILED for @{lead['username']}: {job_err}"
+                print(f"[ERROR] {log_job_err}", file=sys.stderr)
+                with open(log_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{log_job_err}\n")
+                    f.flush()
+                _mark_message_job_failed(job_id, f"Error persistiendo estado del job")
+                raise
+
+        conn.commit()
+        job["status"] = "completed"
+        job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
+        _persist_message_job(job)
+        _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
+        return {"status": "queued", "job": _serialize_message_job(job)}
+    finally:
+        if conn:
+            conn.close()
+        if job_id and job_id in MESSAGE_JOB_STORE:
+            job = MESSAGE_JOB_STORE[job_id]
+            if job["status"] in {"queued", "running"}:
+                _mark_message_job_failed(job_id, "Error inesperado en queue_messages")
 
 
 @app.post("/api/messages/run")
