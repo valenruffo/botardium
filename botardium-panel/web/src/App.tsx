@@ -6,7 +6,7 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { MagicBox } from "@/components/magic-box";
 import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
-import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, LogIn, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2 } from "lucide-react";
+import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, LogIn, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2, Info, Database, CheckCircle, AlertTriangle } from "lucide-react";
 
 declare const __APP_VERSION__: string;
 import { Badge } from "@/components/ui/badge";
@@ -476,6 +476,14 @@ type Workspace = {
   slug: string;
 };
 
+type EmergencyStopResponse = {
+  status: string;
+  message: string;
+  campaigns_stopped: number;
+  warmups_stopped: number;
+  emergency_flag_set: boolean;
+};
+
 // Ordenar workspaces: el actual primero, luego por nombre
 const sortWorkspaces = (workspaces: Workspace[], currentId?: number | null): Workspace[] => {
   return [...workspaces].sort((a, b) => {
@@ -672,6 +680,8 @@ export default function Dashboard() {
   const [showSessionWarmupModal, setShowSessionWarmupModal] = useState(false);
   const [isPreparingDrafts, setIsPreparingDrafts] = useState(false);
   const [isSavingDrafts, setIsSavingDrafts] = useState(false);
+  const [isRegeneratingDraft, setIsRegeneratingDraft] = useState(false);
+  const [isSavingLeadDraft, setIsSavingLeadDraft] = useState(false);
   const [draftProgressLabel, setDraftProgressLabel] = useState('');
   const [expandedCampaigns, setExpandedCampaigns] = useState<Record<string, boolean>>({});
   const [editingCampaignId, setEditingCampaignId] = useState<string | null>(null);
@@ -684,6 +694,9 @@ export default function Dashboard() {
   const [campaignDeleteConfirming, setCampaignDeleteConfirming] = useState<Record<string, boolean>>({});
   const [campaignDeleteLoading, setCampaignDeleteLoading] = useState<Record<string, boolean>>({});
   const campaignDeleteConfirmTimeouts = useRef<Record<string, number>>({});
+  const [showEmergencyStopModal, setShowEmergencyStopModal] = useState(false);
+  const [isEmergencyStopping, setIsEmergencyStopping] = useState(false);
+  const [emergencyStopResult, setEmergencyStopResult] = useState<EmergencyStopResponse | null>(null);
   const openHowTo = () => {
     setCurrentRoute('app');
     setCurrentView('guide');
@@ -795,6 +808,34 @@ export default function Dashboard() {
   const previousLeadsCount = useRef(0);
   const activeAccount = igAccountsData?.[0] ?? null;
   const activeWarmups = (igAccountsData || []).filter((account) => account.warmup_status === 'running');
+
+  const detectSessionExpired = (account: IgAccount | null): boolean => {
+    if (!account) return false;
+    if (account.requires_session_warmup) return true;
+    if (account.last_error) {
+      const lowerError = account.last_error.toLowerCase();
+      return lowerError.includes('session') || lowerError.includes('login') || lowerError.includes('expired') || lowerError.includes('invalid');
+    }
+    return false;
+  };
+
+  const sessionExpiredAccounts = (igAccountsData || []).filter(detectSessionExpired);
+  const needsSessionRelogin = sessionExpiredAccounts.length > 0;
+
+  const handleEnterDashboard = (account: IgAccount | null) => {
+    if (!account) {
+      toast.error('No hay cuenta seleccionada');
+      return;
+    }
+    if (detectSessionExpired(account)) {
+      toast.warning('Esta cuenta requiere re-login. Por favor, re-conecta la sesión antes de entrar al dashboard.', {
+        duration: 5000,
+        icon: '⚠️',
+      });
+      return;
+    }
+    setCurrentRoute('app');
+  };
   const aiBlockedReason = 'Necesitas API keys para usar funciones con IA. Configúralas en API Keys.';
   const hasAiForMessages = !!aiSettings?.message_studio_enabled;
   const hasAiForMagicBox = !!aiSettings?.magic_box_enabled;
@@ -1192,6 +1233,35 @@ export default function Dashboard() {
     }
   };
 
+  const handleEmergencyStop = async () => {
+    try {
+      setIsEmergencyStopping(true);
+      setEmergencyStopResult(null);
+      
+      const res = await apiFetch(apiUrl('/api/emergency/stop-all'), {
+        method: 'POST',
+      });
+      
+      const data: EmergencyStopResponse = await res.json();
+      
+      if (!res.ok) {
+        toast.error(data.message || 'Error en parada de emergencia.');
+        return;
+      }
+      
+      setEmergencyStopResult(data);
+      toast.success(data.message);
+      await mutateBotStatus();
+      await mutateAccounts();
+      
+    } catch (error) {
+      toast.error('Error conectando con el sistema de emergencia.');
+      console.error('Emergency stop error:', error);
+    } finally {
+      setIsEmergencyStopping(false);
+    }
+  };
+
   const handleCampaignDelete = async (campaignId: string, campaignName: string) => {
     if (campaignDeleteLoading[campaignId]) return;
     if (!campaignDeleteConfirming[campaignId]) {
@@ -1338,6 +1408,18 @@ export default function Dashboard() {
       })
       .map((lead) => lead.id)
       .filter((id): id is number => typeof id === 'number');
+  }, [leadsArray, messageStatuses, messageScopeCampaign]);
+
+  const messageScopeBreakdown = useMemo(() => {
+    const allowedStatuses = new Set<string>(messageStatuses);
+    const breakdown: Record<string, number> = {};
+    leadsArray.forEach((lead) => {
+      if (!allowedStatuses.has(String(lead.status || ''))) return;
+      if (messageScopeCampaign && lead.campaign_id !== messageScopeCampaign) return;
+      const status = String(lead.status || '');
+      breakdown[status] = (breakdown[status] || 0) + 1;
+    });
+    return breakdown;
   }, [leadsArray, messageStatuses, messageScopeCampaign]);
   const selectedLeads = useMemo(
     () => leadsArray.filter((lead) => typeof lead.id === 'number' && selectedLeadIds.includes(lead.id)),
@@ -1538,14 +1620,16 @@ export default function Dashboard() {
       });
       const data = await res.json();
       if (!res.ok) {
-        toast.error(data.detail || 'No pude generar previews.');
+        console.error('[Message Studio] Error:', data);
+        toast.error(data.detail || 'No pude generar previews. Revisa la consola para más detalles.');
         return;
       }
       setMessagePreviews(data.previews || []);
       await mutateLeads();
       toast.success(`Borradores preparados para ${data.count || 0} lead(s).`);
-    } catch {
-      toast.error('Error generando previews de mensajes.');
+    } catch (err) {
+      console.error('[Message Studio] Exception:', err);
+      toast.error('Error generando previews de mensajes. Revisa la consola para más detalles.');
     } finally {
       setIsPreparingDrafts(false);
       setDraftProgressLabel('');
@@ -1566,9 +1650,13 @@ export default function Dashboard() {
     try {
       setIsSavingDrafts(true);
       setDraftProgressLabel(`Guardando ${ids.length} borradores en el CRM...`);
+      const timeoutMs = Math.max(120000, ids.length * 5000);
       const res = await apiFetch(apiUrl('/api/messages/queue'), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Timeout': timeoutMs.toString()
+        },
         body: JSON.stringify({
           workspace_id: currentUserId,
           ids,
@@ -1584,13 +1672,16 @@ export default function Dashboard() {
       });
       const data = await res.json();
       if (!res.ok) {
+        console.error('[queueMessages] API error:', res.status, data);
         toast.error(data.detail || 'No pude preparar los mensajes.');
         return;
       }
       await Promise.all([mutateLeads(), mutateMessageJobs()]);
       toast.success('Mensajes preparados. Revisa los borradores antes de enviar.');
-    } catch {
-      toast.error('Error preparando mensajes.');
+    } catch (error) {
+      console.error('[queueMessages] Exception:', error);
+      const msg = error instanceof Error ? error.message : 'Error de conexión con el servidor';
+      toast.error(`Error preparando mensajes: ${msg}`);
     } finally {
       setIsSavingDrafts(false);
       setDraftProgressLabel('');
@@ -1686,6 +1777,7 @@ export default function Dashboard() {
 
   const saveLeadDraft = async () => {
     if (!selectedLeadDraft?.id) return;
+    setIsSavingLeadDraft(true);
     try {
       const res = await apiFetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/draft`), {
         method: 'POST',
@@ -1702,12 +1794,15 @@ export default function Dashboard() {
       toast.success('Borrador actualizado.');
     } catch {
       toast.error('Error guardando el borrador.');
+    } finally {
+      setIsSavingLeadDraft(false);
     }
   };
 
   const regenerateLeadDraft = async () => {
     if (!selectedLeadDraft?.id) return;
     if (!requireAiFeature(hasAiForMessages)) return;
+    setIsRegeneratingDraft(true);
     try {
       const res = await apiFetch(apiUrl(`/api/leads/${selectedLeadDraft.id}/regenerate-draft`), {
         method: 'POST',
@@ -1737,6 +1832,8 @@ export default function Dashboard() {
       toast.success('Borrador regenerado con IA.');
     } catch {
       toast.error('Error regenerando el borrador.');
+    } finally {
+      setIsRegeneratingDraft(false);
     }
   };
 
@@ -1856,7 +1953,7 @@ export default function Dashboard() {
                     {isLoggingIn ? 'Conectando...' : 'Conectar otra cuenta'}
                   </button>
                   {hasAccounts && (
-                    <button onClick={() => setCurrentRoute('app')} className="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm">
+                    <button onClick={() => handleEnterDashboard(activeAccount)} className="bg-purple-600 hover:bg-purple-500 text-white font-medium px-4 py-2 rounded-lg transition-colors text-sm">
                       Ir al Dashboard Principal
                     </button>
                   )}
@@ -1893,13 +1990,21 @@ export default function Dashboard() {
                       <div>
                         <div className="flex flex-wrap items-center gap-2">
                           <p className="font-semibold text-lg text-slate-100">@{acc.ig_username}</p>
-                          <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-400">Conexión Verificada</Badge>
+                          {detectSessionExpired(acc) ? (
+                            <Badge variant="secondary" className="bg-rose-500/10 text-rose-400">Sesión Expirada</Badge>
+                          ) : (
+                            <Badge variant="secondary" className="bg-emerald-500/10 text-emerald-400">Conexión Verificada</Badge>
+                          )}
                           <Badge variant="outline" className="border-slate-700 text-slate-300">
                             {acc.account_type === 'new' ? 'Cuenta nueva' : acc.account_type === 'rehab' ? 'Rehabilitación' : 'Cuenta madura'}
                           </Badge>
-                          <Badge variant="outline" className={`${acc.warmup_status === 'running' ? 'border-amber-500/30 text-amber-300' : acc.requires_session_warmup ? 'border-rose-500/30 text-rose-300' : 'border-emerald-500/30 text-emerald-300'}`}>
-                            {acc.warmup_status === 'running' ? 'Sesión activa' : acc.requires_session_warmup ? 'Sesión fría' : 'Sesión lista'}
-                          </Badge>
+                          {detectSessionExpired(acc) ? (
+                            <Badge variant="outline" className="border-rose-500/30 text-rose-300">⚠️ Sesión Expirada - Re-loguear</Badge>
+                          ) : (
+                            <Badge variant="outline" className={`${acc.warmup_status === 'running' ? 'border-amber-500/30 text-amber-300' : acc.requires_session_warmup ? 'border-rose-500/30 text-rose-300' : 'border-emerald-500/30 text-emerald-300'}`}>
+                              {acc.warmup_status === 'running' ? 'Sesión activa' : acc.requires_session_warmup ? 'Sesión fría' : 'Sesión lista'}
+                            </Badge>
+                          )}
                           {acc.requires_account_warmup && <Badge variant="outline" className="border-rose-500/30 text-rose-300">Calentamiento de cuenta pendiente</Badge>}
                         </div>
                         <p className="mt-3 text-sm text-slate-400">{cleanOperatorMessage(acc.current_action) || 'Aquí gestionas tu cuenta emisora: salud, límites y calentamiento de cuenta. El calentamiento previo al envío se lanza desde CRM.'}</p>
@@ -1958,8 +2063,8 @@ export default function Dashboard() {
                           size="md"
                           className="w-full"
                         />
-                        {acc.session_status === 'verified' ? (
-                          <button onClick={() => setCurrentRoute('app')} className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition-all hover:from-cyan-400 hover:to-emerald-400">
+                        {!detectSessionExpired(acc) ? (
+                          <button onClick={() => handleEnterDashboard(acc)} className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 transition-all hover:from-cyan-400 hover:to-emerald-400">
                             Usar esta cuenta
                           </button>
                         ) : (
@@ -2193,7 +2298,7 @@ export default function Dashboard() {
                   <KeyRound className="w-4 h-4" /> API Keys
                 </button>
                 <button
-                  onClick={() => toast.error("Seguridad: Todas las campañas detenidas.")}
+                  onClick={() => setShowEmergencyStopModal(true)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-rose-400 font-medium hover:bg-rose-500/10 transition-colors border border-transparent hover:border-rose-500/20 group cursor-pointer text-left"
                 >
                   <ShieldAlert className="w-4 h-4 group-hover:scale-110 transition-transform" /> Detener Todo
@@ -2272,6 +2377,88 @@ export default function Dashboard() {
             </div>
           )}
 
+          {showEmergencyStopModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+              <div className="w-full max-w-lg rounded-3xl border border-rose-500/20 bg-slate-900 p-6 shadow-2xl">
+                <div className="flex items-start gap-4">
+                  <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-rose-500/10">
+                    <AlertTriangle className="h-6 w-6 text-rose-500" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-xs uppercase tracking-[0.2em] text-rose-300">Parada de Emergencia</p>
+                    <h3 className="mt-2 text-xl font-semibold text-slate-100">¿Detener todas las operaciones?</h3>
+                    <p className="mt-2 text-sm text-slate-300">
+                      Esta acción cancelará inmediatamente todas las campanas activas y calentamientos de cuenta. 
+                      No se puede deshacer.
+                    </p>
+                    
+                    {isEmergencyStopping && (
+                      <div className="mt-4 flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+                        <Loader2 className="h-5 w-5 animate-spin text-rose-500" />
+                        <p className="text-sm text-slate-300">Deteniendo operaciones...</p>
+                      </div>
+                    )}
+                    
+                    {emergencyStopResult && (
+                      <div className="mt-4 space-y-3">
+                        <div className="flex items-center gap-2 rounded-xl bg-emerald-500/10 p-3 text-sm text-emerald-300">
+                          <CheckCircle className="h-4 w-4" />
+                          <span>{emergencyStopResult.message}</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-center">
+                            <p className="text-xs text-slate-400">Campanas</p>
+                            <p className="text-lg font-semibold text-slate-200">{emergencyStopResult.campaigns_stopped}</p>
+                          </div>
+                          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-center">
+                            <p className="text-xs text-slate-400">Calentamientos</p>
+                            <p className="text-lg font-semibold text-slate-200">{emergencyStopResult.warmups_stopped}</p>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                
+                <div className="mt-6 flex flex-wrap gap-3">
+                  {!emergencyStopResult ? (
+                    <>
+                      <button
+                        onClick={async () => {
+                          await handleEmergencyStop();
+                        }}
+                        disabled={isEmergencyStopping}
+                        className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-medium text-white hover:bg-rose-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {isEmergencyStopping ? 'Deteniendo...' : 'Confirmar Parada'}
+                      </button>
+                      <button
+                        onClick={() => {
+                          setShowEmergencyStopModal(false);
+                          setEmergencyStopResult(null);
+                        }}
+                        disabled={isEmergencyStopping}
+                        className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        Cancelar
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        setShowEmergencyStopModal(false);
+                        setEmergencyStopResult(null);
+                      }}
+                      className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700"
+                    >
+                      Cerrar
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
           {selectedLeadDraft && (
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
               <div className="w-full max-w-2xl rounded-3xl border border-cyan-500/20 bg-slate-900 p-6 shadow-2xl">
@@ -2310,11 +2497,32 @@ export default function Dashboard() {
                     className="mt-3 w-full rounded-xl border border-slate-800 bg-slate-950 px-4 py-3 text-sm text-slate-100 outline-none focus:border-cyan-500"
                   />
                   <div className="mt-4 flex flex-wrap gap-3">
-                    <button onClick={() => { if (requireAiFeature(hasAiForMessages)) void regenerateLeadDraft(); }} title={!hasAiForMessages ? aiBlockedReason : undefined} className={`rounded-xl px-4 py-2 text-sm font-medium ${hasAiForMessages ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20'}`}>
-                      Regenerar con IA
+                    <button 
+                      onClick={() => { if (requireAiFeature(hasAiForMessages) && !isRegeneratingDraft) void regenerateLeadDraft(); }} 
+                      disabled={isRegeneratingDraft || !hasAiForMessages}
+                      title={!hasAiForMessages ? aiBlockedReason : undefined} 
+                      className={`rounded-xl px-4 py-2 text-sm font-medium flex items-center gap-2 ${hasAiForMessages ? 'bg-emerald-600 text-white hover:bg-emerald-500' : 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20'} ${isRegeneratingDraft ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                      {isRegeneratingDraft && (
+                        <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                      )}
+                      {isRegeneratingDraft ? 'Regenerando...' : 'Regenerar con IA'}
                     </button>
-                    <button onClick={saveLeadDraft} className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500">
-                      Guardar borrador
+                    <button 
+                      onClick={() => !isSavingLeadDraft && saveLeadDraft()} 
+                      disabled={isSavingLeadDraft}
+                      className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {isSavingLeadDraft && (
+                        <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                      )}
+                      {isSavingLeadDraft ? 'Guardando...' : 'Guardar borrador'}
                     </button>
                     <button onClick={() => setSelectedLeadDraft(null)} className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
                       Cerrar
@@ -2840,34 +3048,32 @@ export default function Dashboard() {
                 </div>
                 <div className="min-h-[400px] overflow-visible p-0">
                   <table className="w-full text-left text-sm" style={{ tableLayout: 'fixed' }}>
-                    <colgroup>
-                      <col style={{ width: '3%' }} />
-                      <col style={{ width: '18%' }} />
-                      <col style={{ width: '20%' }} />
-                      <col style={{ width: '15%' }} />
-                      <col style={{ width: '12%' }} />
-                      <col style={{ width: '7%' }} />
-                      <col style={{ width: '9%' }} />
-                      <col style={{ width: '7%' }} />
-                      <col style={{ width: '9%' }} />
-                    </colgroup>
+                      <colgroup>
+                        <col style={{ width: '40px' }} />
+                        <col style={{ width: '16%' }} />
+                        <col style={{ width: '26%' }} />
+                        <col style={{ width: '11%' }} />
+                        <col style={{ width: '9%' }} />
+                        <col style={{ width: '13%' }} />
+                        <col style={{ width: '100px' }} />
+                        <col style={{ width: '110px' }} />
+                      </colgroup>
                     <thead className="border-b border-slate-800 bg-slate-900 text-xs uppercase text-slate-400">
                       <tr>
-                        <th className="w-12 bg-slate-900 px-3 py-2">
+                        <th className="w-12 bg-slate-900 px-3 py-3">
                           <GlowCheckbox
                             checked={filteredLeads.length > 0 && selectedLeadIds.length === filteredLeads.map((lead) => lead.id).filter((id): id is number => typeof id === 'number').length}
                             onChange={(next) => next ? selectVisibleLeads() : clearLeadSelection()}
                             ariaLabel="Seleccionar todos los leads visibles"
                           />
                         </th>
-                        <th className="bg-slate-900 px-3 py-2">Usuario IG</th>
-                        <th className="bg-slate-900 px-3 py-2">Mensaje</th>
-                        <th className="bg-slate-900 px-3 py-2">Estado</th>
-                        <th className="bg-slate-900 px-3 py-2">Origen</th>
-                        <th className="bg-slate-900 px-3 py-2">Campaña</th>
-                        <th className="bg-slate-900 px-3 py-2">Detectado</th>
-                        <th className="bg-slate-900 px-3 py-2 text-right">Enviar</th>
-                        <th className="bg-slate-900 px-3 py-2 text-right">Acciones</th>
+                        <th className="bg-slate-900 px-3 py-3 font-semibold tracking-wide text-slate-300">Usuario IG</th>
+                        <th className="bg-slate-900 px-3 py-3 font-semibold tracking-wide text-slate-300">Mensaje</th>
+                        <th className="bg-slate-900 px-3 py-3 font-semibold tracking-wide text-slate-300">Estado</th>
+                        <th className="bg-slate-900 px-3 py-3 font-semibold tracking-wide text-slate-300">Origen</th>
+                        <th className="bg-slate-900 px-3 py-3 font-semibold tracking-wide text-slate-300">Detectado</th>
+                        <th className="bg-slate-900 px-3 py-3 text-left font-semibold tracking-wide text-slate-300">Enviar</th>
+                        <th className="bg-slate-900 px-3 py-3 text-left font-semibold tracking-wide text-slate-300">Acciones</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -2918,7 +3124,7 @@ export default function Dashboard() {
                                     onClick={() => openLeadDraft(lead)}
                                     className="mt-1 inline-flex items-center whitespace-nowrap text-[11px] font-semibold text-cyan-400 transition-colors hover:text-cyan-300"
                                   >
-                                    Ver borrador
+                                    Ver DM
                                   </button>
                                 </div>
                               );
@@ -2943,38 +3149,35 @@ export default function Dashboard() {
                               <HoverText text={formatSourceLabel(lead.source)} className="max-w-full" />
                             </div>
                           </td>
-                          <td className="px-3 py-2 align-middle text-xs text-slate-500">
-                            {lead.campaign_id && campaignLabelById[lead.campaign_id]
-                              ? <HoverText text={formatCampaignOptionLabel(lead.campaign_id)} className="max-w-full">{campaignLabelById[lead.campaign_id]}</HoverText>
-                              : '-'}
-                          </td>
-                          <td className="px-3 py-2 align-middle text-slate-500">
-                            <HoverText text={lead.timestamp ? new Date(lead.timestamp).toLocaleString() : '-'} className="max-w-full">
-                              <div className="text-xs leading-tight">{lead.timestamp ? new Date(lead.timestamp).toLocaleString() : '-'}</div>
-                            </HoverText>
-                            {lead.follow_up_due_at && (
-                              <HoverText text={`Follow-up: ${new Date(lead.follow_up_due_at).toLocaleDateString()}`} className="mt-0.5 max-w-full">
-                                <div className="text-xs text-cyan-400">Follow-up: {new Date(lead.follow_up_due_at).toLocaleDateString()}</div>
+                          <td className="px-3 py-2 align-middle">
+                            <div className="max-w-[180px] truncate text-slate-500">
+                              <HoverText text={lead.timestamp ? new Date(lead.timestamp).toLocaleString() : '-'}>
+                                <div className="text-xs leading-tight truncate">{lead.timestamp ? new Date(lead.timestamp).toLocaleString() : '-'}</div>
                               </HoverText>
-                            )}
+                              {lead.follow_up_due_at && (
+                                <HoverText text={`Follow-up: ${new Date(lead.follow_up_due_at).toLocaleDateString()}`}>
+                                  <div className="mt-0.5 text-xs text-cyan-400 truncate">Follow-up: {new Date(lead.follow_up_due_at).toLocaleDateString()}</div>
+                                </HoverText>
+                              )}
+                            </div>
                           </td>
-                          <td className="px-3 py-2 align-middle text-right">
-                            <div className="flex items-center justify-end gap-2">
+                          <td className="px-3 py-2 align-middle text-left">
+                            <div className="flex items-center justify-start gap-2">
                               <button
                                 onClick={() => sendSingleLead(lead)}
-                                className="min-w-[74px] rounded-lg bg-white px-3 py-1.5 text-xs font-semibold text-slate-950 shadow-sm shadow-white/10 transition-all hover:bg-slate-200"
+                                className="min-w-[80px] rounded-lg bg-gradient-to-r from-white to-slate-100 px-3 py-2 text-xs font-semibold text-slate-900 shadow-sm shadow-white/10 transition-all hover:from-slate-100 hover:to-slate-200 hover:shadow-md"
                               >
                                 Enviar
                               </button>
                             </div>
                           </td>
-                          <td className="px-3 py-2 align-middle text-right">
-                            <div className="flex items-center justify-end">
+                          <td className="px-3 py-2 align-middle text-left">
+                            <div className="flex items-center justify-start">
                               <DropdownMenu>
                                 <DropdownMenuTrigger asChild>
-                                  <button className="inline-flex min-w-[88px] items-center justify-center gap-1 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-800">
+                                  <button className="inline-flex min-w-[90px] items-center justify-center gap-1.5 rounded-lg border border-slate-600 bg-slate-800/80 px-3 py-2 text-xs font-medium text-slate-200 transition-all hover:border-slate-500 hover:bg-slate-700">
                                     Acciones
-                                    <ChevronDown className="h-3.5 w-3.5 text-slate-400" />
+                                    <ChevronDown className="h-3 w-3 text-slate-400" />
                                   </button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end" className="w-48 border-slate-700 bg-slate-800">
@@ -3113,7 +3316,27 @@ export default function Dashboard() {
                     className="mt-3 min-w-[220px] max-w-sm"
                   />
                   <p className="mt-2 text-xs text-slate-400">Aquí solo actualizas borradores. `Pendiente` también entra y usa el mensaje de primer contacto.</p>
-                  <p className="mt-1 text-xs text-slate-500">Leads afectados: {messageScopeLeadIds.length}</p>
+                  
+                  {/* Resumen de estados */}
+                  {messageScopeLeadIds.length > 0 && (
+                    <div className="mt-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-3">
+                      <div className="flex items-center gap-2 text-xs text-cyan-200">
+                        <Info className="h-3.5 w-3.5" />
+                        <span className="font-medium">Esto actualizará {messageScopeLeadIds.length} leads y los pondrá en "Listo para contactar"</span>
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {Object.entries(messageScopeBreakdown).map(([status, count]) => (
+                          count > 0 && (
+                            <div key={status} className="inline-flex items-center gap-1.5 rounded-md bg-slate-800 px-2 py-1 text-[11px] text-slate-300">
+                              <span className="font-medium">{count}</span>
+                              <span className="text-slate-500">en</span>
+                              <span className="text-slate-200">{status}</span>
+                            </div>
+                          )
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
 
                 <div className="mt-4 grid grid-cols-1 gap-3 xl:grid-cols-3">
@@ -3161,14 +3384,15 @@ export default function Dashboard() {
                   </div>
                 )}
 
-                <div className="mt-4 flex flex-wrap items-center gap-2">
-                  <button onClick={() => { if (requireAiFeature(hasAiForMessages)) void previewPendingDraftsFromMessages(); }} disabled={isPreparingDrafts || isSavingDrafts || messageScopeLeadIds.length === 0} title={!hasAiForMessages ? aiBlockedReason : undefined} className={`rounded-lg px-3 py-1.5 text-xs font-medium disabled:opacity-40 ${hasAiForMessages ? 'bg-slate-800 text-slate-100 hover:bg-slate-700' : 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20'}`}>
-                    {isPreparingDrafts ? 'Generando...' : 'Generar muestra IA'}
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <button onClick={() => { if (requireAiFeature(hasAiForMessages)) void updatePendingDraftsFromMessages(); }} disabled={isPreparingDrafts || isSavingDrafts || messageScopeLeadIds.length === 0} title={!hasAiForMessages ? aiBlockedReason : undefined} className={`inline-flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold disabled:opacity-40 ${hasAiForMessages ? 'bg-white text-slate-950 hover:bg-slate-200' : 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20'}`}>
+                    {isSavingDrafts ? (
+                      <><Loader2 className="h-4 w-4 animate-spin" /> Actualizando...</>
+                    ) : (
+                      <><Database className="h-4 w-4" /> Actualizar {messageScopeLeadIds.length} DMs en CRM</>
+                    )}
                   </button>
-                  <button onClick={() => { if (requireAiFeature(hasAiForMessages)) void updatePendingDraftsFromMessages(); }} disabled={isPreparingDrafts || isSavingDrafts || messageScopeLeadIds.length === 0} title={!hasAiForMessages ? aiBlockedReason : undefined} className={`rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-40 ${hasAiForMessages ? 'bg-white text-slate-950 hover:bg-slate-200' : 'bg-rose-500/15 text-rose-200 ring-1 ring-rose-500/30 hover:bg-rose-500/20'}`}>
-                    {isSavingDrafts ? 'Actualizando...' : 'Actualizar borradores'}
-                  </button>
-                  <button onClick={() => setCurrentView('crm')} className="rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-700">
+                  <button onClick={() => setCurrentView('crm')} className="rounded-lg bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
                     Volver al CRM
                   </button>
                 </div>

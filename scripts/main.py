@@ -936,6 +936,15 @@ class MagicBoxResponse(BaseModel):
     reasoning: str
     filter_context: StrategyFilterContext = StrategyFilterContext()
 
+
+class EmergencyStopResult(BaseModel):
+    status: str
+    message: str
+    campaigns_stopped: int
+    warmups_stopped: int
+    emergency_flag_set: bool
+
+
 class BotConfig(BaseModel):
     username: str
     target_type: str
@@ -1087,7 +1096,7 @@ def _delete_campaign(campaign_id: str) -> None:
     conn.close()
 
 
-def _mark_message_job_failed(job_id: str, error_message: str) -> None:
+def _mark_message_job_failed(job_id: str, error_message: str, conn: sqlite3.Connection | None = None) -> None:
     job = MESSAGE_JOB_STORE.get(job_id)
     if not job:
         return
@@ -1099,11 +1108,14 @@ def _mark_message_job_failed(job_id: str, error_message: str) -> None:
         "timestamp": int(time.time()),
     })
     job["logs"] = job["logs"][:12]
-    _persist_message_job(job)
+    _persist_message_job(job, conn)
 
 
-def _persist_message_job(job: Dict[str, Any]) -> None:
-    conn = _connect_db()
+def _persist_message_job(job: Dict[str, Any], conn: sqlite3.Connection | None = None) -> None:
+    own_conn = False
+    if conn is None:
+        conn = _connect_db()
+        own_conn = True
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -1118,8 +1130,9 @@ def _persist_message_job(job: Dict[str, Any]) -> None:
             datetime.now().isoformat(),
         ),
     )
-    conn.commit()
-    conn.close()
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
 def _load_persisted_runtime_state() -> None:
@@ -3366,6 +3379,75 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
 
     raise HTTPException(status_code=400, detail="Accion no soportada.")
 
+
+@app.post("/api/emergency/stop-all")
+async def emergency_stop_all(request: Request):
+    """🚨 Detener todo: Cancela todas las campanas y calentamientos de cuenta."""
+    from scripts.outreach_manager import EMERGENCY_FLAG
+    
+    actor = _require_actor(request)
+    
+    campaigns_stopped = 0
+    warmups_stopped = 0
+    
+    try:
+        for campaign_id in list(CAMPAIGN_TASKS.keys()):
+            task = CAMPAIGN_TASKS.get(campaign_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            
+            campaign = CAMPAIGN_STORE.get(campaign_id)
+            if campaign:
+                campaign["status"] = "stopped"
+                campaign["current_action"] = "Detenido por emergencia."
+                _append_campaign_log(campaign, campaign["current_action"])
+                _persist_campaign(campaign)
+                _audit_event("emergency.stop_campaign", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
+            
+            campaigns_stopped += 1
+        
+        for account_id in list(ACCOUNT_WARMUP_TASKS.keys()):
+            task = ACCOUNT_WARMUP_TASKS.get(account_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            
+            account = _get_account(account_id)
+            if account:
+                conn = _connect_db()
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE ig_accounts SET warmup_status = ? WHERE id = ?",
+                    ("idle", account_id),
+                )
+                conn.commit()
+                conn.close()
+                _audit_event("emergency.stop_warmup", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
+            
+            warmups_stopped += 1
+        
+        EMERGENCY_FLAG.touch()
+        _audit_event("emergency.stop_all", actor, actor.workspace_id, "allowed", "system", detail=f"Stopped {campaigns_stopped} campaigns, {warmups_stopped} warmups")
+        
+        return EmergencyStopResult(
+            status="success",
+            message=f"🚨 Emergencia ejecutada: {campaigns_stopped} campanas y {warmups_stopped} calentamientos detenidos.",
+            campaigns_stopped=campaigns_stopped,
+            warmups_stopped=warmups_stopped,
+            emergency_flag_set=True,
+        )
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en parada de emergencia: {str(e)}")
+
+
 @app.get("/api/leads")
 async def get_leads(workspace_id: int, request: Request, campaign_id: Optional[str] = None):
     """Retorna los datos del CRM desde SQLite/Postgres."""
@@ -3649,7 +3731,7 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
             "logs": [],
         }
         MESSAGE_JOB_STORE[job_id] = job
-        _persist_message_job(job)
+        _persist_message_job(job, conn)
 
         now = datetime.now()
         follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
@@ -3685,7 +3767,7 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
                     f.write(f"ERROR: {error_msg}\n")
                     f.write(f"TRACEBACK: {tb}\n")
                     f.flush()
-                _mark_message_job_failed(job_id, f"Error generando mensaje para @{lead['username']}")
+                _mark_message_job_failed(job_id, f"Error generando mensaje para @{lead['username']}", conn)
                 raise HTTPException(status_code=500, detail=f"Error generando mensaje para @{lead['username']}: {str(e)}")
             try:
                 cursor.execute(
@@ -3724,7 +3806,7 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(f"{log_db_err}\n")
                     f.flush()
-                _mark_message_job_failed(job_id, f"Error guardando mensaje en DB para @{lead['username']}")
+                _mark_message_job_failed(job_id, f"Error guardando mensaje en DB para @{lead['username']}", conn)
                 raise HTTPException(status_code=500, detail=f"Error guardando mensaje en DB: {str(db_err)}")
             try:
                 job["processed"] = idx
@@ -3734,7 +3816,7 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
                 job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
                 job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
                 job["logs"] = job["logs"][:12]
-                _persist_message_job(job)
+                _persist_message_job(job, conn)
                 log_job = f"Job persistido OK para @{lead['username']}"
                 print(f"[DEBUG] {log_job}", file=sys.stderr)
                 with open(log_file, 'a', encoding='utf-8') as f:
@@ -3746,22 +3828,33 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
                 with open(log_file, 'a', encoding='utf-8') as f:
                     f.write(f"{log_job_err}\n")
                     f.flush()
-                _mark_message_job_failed(job_id, f"Error persistiendo estado del job")
+                _mark_message_job_failed(job_id, f"Error persistiendo estado del job", conn)
                 raise
 
         conn.commit()
+        print(f"[DEBUG] queue_messages: Committed DB changes", file=sys.stderr)
         job["status"] = "completed"
         job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
-        _persist_message_job(job)
-        _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
+        _persist_message_job(job, conn)
+        print(f"[DEBUG] queue_messages: Persisted job to DB", file=sys.stderr)
+        try:
+            _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
+            print(f"[DEBUG] queue_messages: Audit event logged", file=sys.stderr)
+        except Exception as audit_err:
+            print(f"[WARN] queue_messages: Audit event failed: {audit_err}", file=sys.stderr)
+        print(f"[DEBUG] queue_messages: Returning response with job_id={job_id}", file=sys.stderr)
         return {"status": "queued", "job": _serialize_message_job(job)}
     finally:
+        print(f"[DEBUG] queue_messages: FINALLY block running, job_id={job_id}, conn={conn is not None}", file=sys.stderr)
         if conn:
             conn.close()
+            print(f"[DEBUG] queue_messages: FINALLY closed DB connection", file=sys.stderr)
         if job_id and job_id in MESSAGE_JOB_STORE:
             job = MESSAGE_JOB_STORE[job_id]
+            print(f"[DEBUG] queue_messages: FINALLY checking job status={job.get('status')}", file=sys.stderr)
             if job["status"] in {"queued", "running"}:
-                _mark_message_job_failed(job_id, "Error inesperado en queue_messages")
+                print(f"[DEBUG] queue_messages: FINALLY marking job as failed", file=sys.stderr)
+                _mark_message_job_failed(job_id, "Error inesperado en queue_messages", None)
 
 
 @app.post("/api/messages/run")
