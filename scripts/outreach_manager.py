@@ -38,7 +38,7 @@ from scripts.session_manager import load_or_create_session
 from skills.db_manager import DatabaseManager
 from skills.human_interactor import type_like_human, random_scroll
 from skills.stealth_mod import add_behavior_noise
-from scripts.core_warmer import run_warmeo, _capitalize_to_memoria
+from scripts.core_warmer import run_warmeo, _capitalize_to_memoria, run_micro_warmup
 from scripts.job_runtime import (
     JobRuntime,
     JobStatus,
@@ -595,6 +595,8 @@ async def _run_outreach_impl(
                 dms_sent_this_session += 1
                 consecutive_actions_for_ip_rotation += 1
                 memory_log["dms_sent"] += 1
+                dm_send_success = True
+                
                 if progress_hook:
                     eta_min, eta_max = _estimate_eta_range(i + 1, len(leads))
                     await progress_hook({
@@ -615,8 +617,31 @@ async def _run_outreach_impl(
                         },
                     })
                 processed_count += 1
+                
+                if dm_send_success and not dry_run:
+                    micro_warmup_duration = profile.get("micro_warmup_duration_min", 3.0)
+                    logger.info(f"🔥 Iniciando micro-warmup post-DM ({micro_warmup_duration} min)...")
+                    
+                    try:
+                        micro_result = await run_micro_warmup(
+                            page=page,
+                            account_profile=profile,
+                            duration_min=micro_warmup_duration,
+                            dry_run=False
+                        )
+                        
+                        if micro_result.get("success"):
+                            logger.info(f"   ✅ Micro-warmup completado: {micro_result['duration_actual_sec']:.1f}s, actividades: {micro_result['activities_completed']}")
+                            if micro_result.get("popups_detected"):
+                                logger.warning(f"   ⚠️ Popups detectados: {micro_result['popups_detected']}")
+                        else:
+                            logger.warning(f"   ⚠️ Micro-warmup con errores: {micro_result.get('error', 'Unknown error')}")
+                            
+                    except Exception as e:
+                        logger.error(f"   ❌ Error en micro-warmup: {e}")
 
             except Exception as e:
+                dm_send_success = False
                 logger.error(f"Error escribiendo DM a @{username}: {e}")
                 db.update_status(username, "Error - Fallo envio")
                 db.update_lead_after_message(username, "Error - Fallo envio", result="error_envio", error_detail=str(e))

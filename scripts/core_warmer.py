@@ -278,6 +278,266 @@ async def _check_for_popups(page) -> list:
     return popups_detected
 
 
+async def _check_dangerous_popup(page) -> str | None:
+    """
+    Verifica si hay un popup peligroso que requiere abortar inmediatamente.
+    Retorna el tipo de popup peligroso o None si no hay.
+    """
+    dangerous_checks = [
+        ('text="Try Again Later"', "RATE_LIMIT"),
+        ('text="unusual activity"', "SUSPICIOUS_ACTIVITY"),
+        ('text="Action Blocked"', "ACTION_BLOCKED"),
+    ]
+    
+    for selector, popup_type in dangerous_checks:
+        try:
+            element = await page.query_selector(selector)
+            if element and await element.is_visible():
+                return popup_type
+        except Exception:
+            continue
+    
+    return None
+
+
+async def _check_session_expiry(page) -> bool:
+    """
+    Verifica si la sesión expiró (redireccion a login).
+    Retorna True si la sesión expiró, False si está activa.
+    """
+    try:
+        if "/accounts/login" in page.url or "/challenge" in page.url:
+            return True
+        
+        login_indicators = [
+            'text="Log in"',
+            'text="Iniciar sesión"',
+            'input[name="username"]',
+        ]
+        
+        for indicator in login_indicators:
+            try:
+                element = await page.query_selector(indicator)
+                if element and await element.is_visible():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    
+    return False
+
+
+async def _micro_feed_scroll(page, duration_sec: float = 8.0):
+    """
+    Actividad de micro-warmup: scroll breve por el feed.
+    """
+    try:
+        start_time = time.time()
+        scrolls_done = 0
+        
+        while time.time() - start_time < duration_sec:
+            scroll_amount = random.randint(200, 500)
+            await page.mouse.wheel(0, scroll_amount)
+            scrolls_done += 1
+            
+            read_time = random.uniform(2, 5)
+            await asyncio.sleep(read_time)
+            
+            if random.random() < 0.3:
+                await page.mouse.wheel(0, -random.randint(100, 200))
+                await asyncio.sleep(random.uniform(1, 2))
+        
+        logger.debug(f"    Micro feed scroll: {scrolls_done} scrolls")
+        return True
+    except Exception as e:
+        logger.warning(f"    Micro feed scroll error: {e}")
+        return False
+
+
+async def _micro_stories_view(page, duration_sec: float = 6.0):
+    """
+    Actividad de micro-warmup: ver stories brevemente.
+    """
+    try:
+        start_time = time.time()
+        stories_viewed = 0
+        
+        if "/explore" in page.url or page.url != IG_BASE:
+            await page.goto(IG_BASE, wait_until="domcontentloaded")
+            await asyncio.sleep(random.uniform(1, 2))
+        
+        story_selectors = [
+            'div[role="button"] canvas',
+            'button[aria-label*="Story"]',
+            'header section canvas',
+        ]
+        
+        while time.time() - start_time < duration_sec:
+            for selector in story_selectors:
+                try:
+                    stories = await page.query_selector_all(selector)
+                    if stories and len(stories) > 1:
+                        idx = random.randint(1, min(len(stories) - 1, 4))
+                        await stories[idx].click()
+                        await asyncio.sleep(random.uniform(2, 4))
+                        stories_viewed += 1
+                        
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(random.uniform(1, 2))
+                        break
+                except Exception:
+                    continue
+            
+            if stories_viewed == 0:
+                await asyncio.sleep(random.uniform(2, 4))
+                break
+        
+        logger.debug(f"    Micro stories: {stories_viewed} vistas")
+        return True
+    except Exception as e:
+        logger.warning(f"    Micro stories error: {e}")
+        return False
+
+
+async def _micro_explore_brief(page, duration_sec: float = 4.0):
+    """
+    Actividad de micro-warmup: visita breve a Explore.
+    """
+    try:
+        await page.goto(f"{IG_BASE}explore/", wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(2, 3))
+        
+        for _ in range(random.randint(1, 2)):
+            await page.mouse.wheel(0, random.randint(150, 300))
+            await asyncio.sleep(random.uniform(1, 2))
+        
+        await page.goto(IG_BASE, wait_until="domcontentloaded")
+        await asyncio.sleep(random.uniform(1, 2))
+        
+        logger.debug("    Micro explore: completado")
+        return True
+    except Exception as e:
+        logger.warning(f"    Micro explore error: {e}")
+        return False
+
+
+async def _micro_idle_behavior(page, duration_sec: float = 3.0):
+    """
+    Actividad de micro-warmup: comportamiento idle (mouse movement, pausas).
+    """
+    try:
+        from skills.stealth_mod import add_behavior_noise
+        await add_behavior_noise(page, duration_seconds=int(duration_sec))
+        logger.debug("    Micro idle: completado")
+        return True
+    except Exception as e:
+        logger.warning(f"    Micro idle error: {e}")
+        return False
+
+
+async def run_micro_warmup(page, account_profile: dict, duration_min: float = 3.0, dry_run: bool = False) -> dict:
+    """
+    Ejecuta un micro-warmup después de enviar DMs exitosamente.
+    
+    Args:
+        page: Página de Patchright activa
+        account_profile: Perfil de cuenta con configuración
+        duration_min: Duración objetivo en minutos (default 3.0)
+        dry_run: Si True, solo loguea sin ejecutar
+    
+    Returns:
+        dict con: success, duration_actual_sec, activities_completed, popups_detected, error
+    """
+    result = {
+        "success": False,
+        "duration_actual_sec": 0.0,
+        "activities_completed": [],
+        "popups_detected": [],
+        "error": None,
+    }
+    
+    start_time = time.time()
+    
+    if dry_run:
+        logger.info("   🌡️ Micro-warmup [DRY RUN] - skip ejecución real")
+        result["success"] = True
+        result["duration_actual_sec"] = 0.0
+        return result
+    
+    logger.info("🔥 Ejecutando micro-warmup...")
+    
+    try:
+        dangerous = await _check_dangerous_popup(page)
+        if dangerous:
+            logger.warning(f"   🚨 Popup peligroso detectado: {dangerous} - abortando micro-warmup")
+            result["popups_detected"].append(dangerous)
+            result["error"] = f"Dangerous popup: {dangerous}"
+            return result
+        
+        expired = await _check_session_expiry(page)
+        if expired:
+            logger.error("   ❌ Sesión expirada detectada - abortando micro-warmup")
+            result["error"] = "Session expired"
+            return result
+        
+        activities = [
+            ("feed_scroll", _micro_feed_scroll, duration_min * 60 * 0.40, 0.40),
+            ("stories_view", _micro_stories_view, duration_min * 60 * 0.30, 0.30),
+            ("explore_brief", _micro_explore_brief, duration_min * 60 * 0.15, 0.15),
+            ("idle_behavior", _micro_idle_behavior, duration_min * 60 * 0.15, 0.15),
+        ]
+        
+        random.shuffle(activities)
+        
+        for activity_name, activity_func, max_duration, probability in activities:
+            if random.random() > probability and activity_name != "feed_scroll":
+                logger.debug(f"   ⏭️ Skipping {activity_name} por probabilidad")
+                continue
+            
+            dangerous = await _check_dangerous_popup(page)
+            if dangerous:
+                logger.warning(f"   🚨 Popup peligroso durante {activity_name}: {dangerous}")
+                result["popups_detected"].append(dangerous)
+                break
+            
+            expired = await _check_session_expiry(page)
+            if expired:
+                result["error"] = "Session expired"
+                break
+            
+            remaining = (duration_min * 60) - (time.time() - start_time)
+            if remaining <= 0:
+                break
+            
+            activity_duration = min(max_duration, remaining * 0.8)
+            
+            try:
+                success = await activity_func(page, activity_duration)
+                if success:
+                    result["activities_completed"].append(activity_name)
+                    logger.debug(f"   ✅ {activity_name} completado")
+            except Exception as e:
+                logger.warning(f"   ⚠️ {activity_name} fallo: {e}")
+        
+        result["success"] = len(result["activities_completed"]) > 0
+        
+    except Exception as e:
+        result["error"] = str(e)
+        logger.error(f"   ❌ Micro-warmup error: {e}")
+    
+    finally:
+        elapsed = time.time() - start_time
+        result["duration_actual_sec"] = round(elapsed, 2)
+        
+        if result["success"]:
+            logger.info(f"   ✅ Micro-warmup completado ({elapsed:.1f}s, {len(result['activities_completed'])} actividades)")
+        else:
+            logger.warning(f"   ⚠️ Micro-warmup finalizado con errores: {result['error']}")
+    
+    return result
+
+
 # --------------------------------------------------------------------------- #
 #  Capitalización (Compound)
 # --------------------------------------------------------------------------- #
