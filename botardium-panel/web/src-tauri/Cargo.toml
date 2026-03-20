@@ -1,6 +1,6 @@
 [package]
 name = "botardium-desktop"
-version = "1.0.2"
+version = "1.1.0"
 description = "Botardium desktop shell for Windows"
 authors = ["Botardium"]
 license = "Proprietary"
@@ -24,4 +24,8 @@ log = "0.4"
 tauri = { version = "2.10.3", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
+tauri-plugin-process = "2"
 tauri-plugin-shell = "2"
+
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-updater = "2"

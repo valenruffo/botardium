@@ -4,6 +4,8 @@ import useSWR from "swr";
 import { toast } from "sonner";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { check as checkNativeUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import { MagicBox } from "@/components/magic-box";
 import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
 import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, LogIn, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2, Info, Database, CheckCircle, AlertTriangle } from "lucide-react";
@@ -812,6 +814,13 @@ type UpdateStatus = {
   detail?: string;
 };
 
+type NativeUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'no_update' | 'fallback' | 'error';
+
+type NativeUpdateMeta = {
+  version: string;
+  notes?: string;
+};
+
 export default function Dashboard() {
   const [currentRoute, setCurrentRoute] = useState<'auth' | 'register' | 'accounts' | 'app'>('auth');
   const [currentView, setCurrentView] = useState<'dashboard' | 'crm' | 'campaigns' | 'message_studio' | 'account_status' | 'guide' | 'api_keys' | 'admin_accounts'>('dashboard');
@@ -832,6 +841,10 @@ export default function Dashboard() {
   const [openAiApiKeyInput, setOpenAiApiKeyInput] = useState("");
   const [isSavingAiKeys, setIsSavingAiKeys] = useState(false);
   const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
+  const [updatePhase, setUpdatePhase] = useState<NativeUpdatePhase>('idle');
+  const [updatePhaseMessage, setUpdatePhaseMessage] = useState('Listo para revisar updates.');
+  const [nativeUpdateMeta, setNativeUpdateMeta] = useState<NativeUpdateMeta | null>(null);
+  const [nativeDownloadPercent, setNativeDownloadPercent] = useState<number | null>(null);
   const [isExportingWorkspace, setIsExportingWorkspace] = useState(false);
   const [isImportingWorkspace, setIsImportingWorkspace] = useState(false);
   const [currentUserId, setCurrentUserId] = useState<number | null>(null);
@@ -882,6 +895,8 @@ export default function Dashboard() {
   const [isEmergencyStopping, setIsEmergencyStopping] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
   const [emergencyStopResult, setEmergencyStopResult] = useState<EmergencyStopResponse | null>(null);
+  const nativeUpdateRef = useRef<Awaited<ReturnType<typeof checkNativeUpdate>> | null>(null);
+  const updateActionLockRef = useRef(false);
   const openHowTo = () => {
     setCurrentRoute('app');
     setCurrentView('guide');
@@ -1203,31 +1218,161 @@ export default function Dashboard() {
   };
 
   const checkForUpdates = async () => {
+    if (updateActionLockRef.current) return;
     try {
+      updateActionLockRef.current = true;
       setIsCheckingUpdates(true);
+      setNativeDownloadPercent(null);
+      setUpdatePhase('checking');
+      setUpdatePhaseMessage('Buscando actualización nativa...');
+
+      if (isTauriDesktop()) {
+        const update = await checkNativeUpdate({ timeout: 8000 });
+        if (update) {
+          nativeUpdateRef.current = update;
+          const normalizedNotes = String(update.body || '').trim();
+          setNativeUpdateMeta({
+            version: update.version,
+            notes: normalizedNotes || undefined,
+          });
+          setUpdatePhase('available');
+          setUpdatePhaseMessage(`Update nativo disponible: ${update.version}.`);
+          console.info('[updater] update_available', { version: update.version });
+          toast.success(`Hay una actualización disponible: ${update.version}.`);
+          return;
+        }
+
+        nativeUpdateRef.current = null;
+        setNativeUpdateMeta(null);
+        setUpdatePhase('no_update');
+        setUpdatePhaseMessage(`Ya estás en la última versión (${__APP_VERSION__}).`);
+        console.info('[updater] check_ok', { update_available: false });
+        toast.success(`Ya estás en la última versión (${__APP_VERSION__}).`);
+        return;
+      }
+
       const data = await mutateUpdateStatus();
       if (!data?.ok) {
+        setUpdatePhase('error');
+        setUpdatePhaseMessage(data?.detail || 'No pude consultar actualizaciones.');
         toast.error(data?.detail || 'No pude consultar actualizaciones.');
         return;
       }
       if (data.update_available) {
+        setUpdatePhase('fallback');
+        setUpdatePhaseMessage('Modo compatibilidad activo: update manual disponible.');
+        console.info('[updater] fallback_used', { reason: 'not_desktop_runtime' });
         toast.success(`Hay una actualización disponible: ${data.latest_version}.`);
         return;
       }
+      setUpdatePhase('no_update');
+      setUpdatePhaseMessage(`Ya estás en la última versión (${data.current_version}).`);
       toast.success(`Ya estás en la última versión (${data.current_version}).`);
-    } catch {
-      toast.error('Error revisando actualizaciones.');
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Error revisando actualizaciones.';
+      nativeUpdateRef.current = null;
+      setNativeUpdateMeta(null);
+      setUpdatePhase('fallback');
+      setUpdatePhaseMessage('Updater nativo no disponible. Activando modo compatibilidad.');
+      console.warn('[updater] error_code', { stage: 'check', detail });
+
+      const fallback = await mutateUpdateStatus().catch(() => null);
+      if (fallback?.ok) {
+        if (fallback.update_available) {
+          setUpdatePhase('fallback');
+          setUpdatePhaseMessage('Modo compatibilidad activo: update manual disponible.');
+          toast.warning('Updater nativo no disponible. Podés descargar el instalador manualmente.');
+          return;
+        }
+
+        const fallbackVersion = fallback.current_version || __APP_VERSION__;
+        setUpdatePhase('no_update');
+        setUpdatePhaseMessage(`Ya estás en la última versión (${fallbackVersion}).`);
+        toast.success(`Ya estás en la última versión (${fallbackVersion}).`);
+        return;
+      }
+
+      setUpdatePhase('error');
+      setUpdatePhaseMessage(detail || 'No pude revisar actualizaciones.');
+      toast.error(detail || 'Error revisando actualizaciones.');
     } finally {
       setIsCheckingUpdates(false);
+      updateActionLockRef.current = false;
     }
   };
 
-  const openUpdateDownload = async () => {
+  const runLegacyUpdateFlow = async () => {
     if (!updateStatus?.download_url) {
       toast.error('No encontré un instalador publicado para descargar.');
       return;
     }
+    setUpdatePhase('fallback');
+    setUpdatePhaseMessage('Modo compatibilidad activo: abriendo descarga manual.');
+    console.info('[updater] fallback_used', { reason: 'native_unavailable_or_error' });
     await openExternal(updateStatus.download_url);
+  };
+
+  const installNativeUpdate = async () => {
+    if (updateActionLockRef.current) return;
+
+    const pendingUpdate = nativeUpdateRef.current;
+    if (!pendingUpdate || !isTauriDesktop()) {
+      await runLegacyUpdateFlow();
+      return;
+    }
+
+    try {
+      updateActionLockRef.current = true;
+      setNativeDownloadPercent(0);
+      setUpdatePhase('downloading');
+      setUpdatePhaseMessage('Descargando actualización nativa en segundo plano...');
+
+      let downloadedBytes = 0;
+      let contentLength = 0;
+
+      await pendingUpdate.downloadAndInstall((event: any) => {
+        if (!event || typeof event !== 'object') return;
+
+        if (event.event === 'Started') {
+          contentLength = Number(event.data?.contentLength || 0);
+          setUpdatePhase('downloading');
+          setUpdatePhaseMessage('Descarga iniciada...');
+          console.info('[updater] download_progress', { started: true, content_length: contentLength || null });
+          return;
+        }
+
+        if (event.event === 'Progress') {
+          downloadedBytes += Number(event.data?.chunkLength || 0);
+          if (contentLength > 0) {
+            const percent = Math.min(100, Math.max(1, Math.round((downloadedBytes / contentLength) * 100)));
+            setNativeDownloadPercent(percent);
+            setUpdatePhaseMessage(`Descargando actualización... ${percent}%`);
+          }
+          return;
+        }
+
+        if (event.event === 'Finished') {
+          setNativeDownloadPercent(100);
+          setUpdatePhase('installing');
+          setUpdatePhaseMessage('Instalando actualización...');
+        }
+      });
+
+      setUpdatePhase('installing');
+      setUpdatePhaseMessage('Instalación completa. Relanzando app...');
+      console.info('[updater] install_ok', { version: pendingUpdate.version });
+      toast.success('Actualización instalada. Reiniciando Botardium...');
+      await relaunch();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Error instalando update nativo.';
+      setUpdatePhase('fallback');
+      setUpdatePhaseMessage('Falló la instalación nativa. Pasando a modo compatibilidad.');
+      console.warn('[updater] error_code', { stage: 'install', detail });
+      toast.error('No pude completar la instalación nativa. Te paso al flujo manual.');
+      await runLegacyUpdateFlow();
+    } finally {
+      updateActionLockRef.current = false;
+    }
   };
 
   const exportWorkspace = async () => {
@@ -2628,19 +2773,31 @@ export default function Dashboard() {
               <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
                 <div className="flex items-center justify-between gap-3">
                   <span>Botardium {__APP_VERSION__}</span>
-                  {updateStatus?.update_available ? <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">update</span> : null}
+                  {nativeUpdateMeta?.version || updateStatus?.update_available ? <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">update</span> : null}
                 </div>
                 <div className="mt-3 space-y-2">
-                  <button onClick={() => { void checkForUpdates(); }} className="flex w-full items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200">
-                    <span>{isCheckingUpdates ? 'Buscando update...' : 'Buscar actualización'}</span>
+                  <button onClick={() => { void checkForUpdates(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50">
+                    <span>{isCheckingUpdates || updatePhase === 'checking' ? 'Buscando update...' : 'Buscar actualización'}</span>
                     <Sparkles className="h-3.5 w-3.5" />
                   </button>
-                  {updateStatus?.update_available ? (
-                    <button onClick={() => { void openUpdateDownload(); }} className="flex w-full items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-left text-emerald-200 hover:bg-emerald-500/15">
-                      <span>Actualizar a {updateStatus.latest_version}</span>
+                  {nativeUpdateMeta?.version || updateStatus?.update_available ? (
+                    <button onClick={() => { void installNativeUpdate(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-left text-emerald-200 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-50">
+                      <span>
+                        {updatePhase === 'downloading'
+                          ? `Descargando ${nativeDownloadPercent ? `${nativeDownloadPercent}%` : '...'}`
+                          : updatePhase === 'installing'
+                            ? 'Instalando update...'
+                            : nativeUpdateMeta?.version
+                              ? `Actualizar ahora (in-app) a ${nativeUpdateMeta.version}`
+                              : `Descargar instalador ${updateStatus?.latest_version ? `(${updateStatus.latest_version})` : ''}`}
+                      </span>
                       <KeyRound className="h-3.5 w-3.5" />
                     </button>
                   ) : null}
+                  <div className="rounded-xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 text-[11px] leading-relaxed text-slate-400">
+                    {updatePhaseMessage}
+                    {updatePhase === 'fallback' ? <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-300">modo compatibilidad</span> : null}
+                  </div>
                 </div>
               </div>
             </div>
