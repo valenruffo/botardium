@@ -38,7 +38,7 @@ from scripts.session_manager import load_or_create_session
 from skills.db_manager import DatabaseManager
 from skills.human_interactor import type_like_human, random_scroll
 from skills.stealth_mod import add_behavior_noise
-from scripts.core_warmer import run_warmeo, _capitalize_to_memoria, run_micro_warmup
+from scripts.core_warmer import run_warmeo, _capitalize_to_memoria, run_pre_dm_warmup
 from scripts.job_runtime import (
     JobRuntime,
     JobStatus,
@@ -490,7 +490,32 @@ async def _run_outreach_impl(
             if random.random() < 0.3:
                 await random_scroll(page, "up", (100, 300), (1, 3))
 
-            # 6. Click Mensaje
+            # 6. Warmup corto pre-DM (mandatorio por lead)
+            pre_warmup_seconds = random.uniform(
+                float(profile.get("pre_dm_warmup_seconds_min", 12)),
+                float(profile.get("pre_dm_warmup_seconds_max", 28)),
+            )
+            logger.info(f"🔥 Warmup pre-DM para @{username} ({pre_warmup_seconds:.1f}s) antes de abrir composer...")
+            pre_warmup = await run_pre_dm_warmup(
+                page=page,
+                account_profile=profile,
+                duration_seconds=pre_warmup_seconds,
+                dry_run=dry_run,
+            )
+            if not pre_warmup.get("success"):
+                logger.warning(f"Warmup pre-DM no fue exitoso para @{username}. Se omite envío en este lead por seguridad.")
+                db.update_status(username, "Error - Warmup previo")
+                db.update_lead_after_message(
+                    username,
+                    "Error - Warmup previo",
+                    result="warmup_pre_dm_fallido",
+                    error_detail=str(pre_warmup.get("error") or "Warmup pre-DM incompleto"),
+                )
+                errors += 1
+                processed_count += 1
+                continue
+
+            # 7. Click Mensaje
             try:
                 if not await _open_message_composer(page):
                     logger.warning(f"No se pudo encontrar el boton Mensaje para @{username}.")
@@ -547,7 +572,7 @@ async def _run_outreach_impl(
                     })
                 continue
 
-            # 7. Redactar y Enviar DM
+            # 8. Redactar y Enviar DM
             try:
                 message_template = _runtime_message_for_lead(lead)
                 if not message_template:
@@ -617,28 +642,6 @@ async def _run_outreach_impl(
                         },
                     })
                 processed_count += 1
-                
-                if dm_send_success and not dry_run:
-                    micro_warmup_duration = profile.get("micro_warmup_duration_min", 3.0)
-                    logger.info(f"🔥 Iniciando micro-warmup post-DM ({micro_warmup_duration} min)...")
-                    
-                    try:
-                        micro_result = await run_micro_warmup(
-                            page=page,
-                            account_profile=profile,
-                            duration_min=micro_warmup_duration,
-                            dry_run=False
-                        )
-                        
-                        if micro_result.get("success"):
-                            logger.info(f"   ✅ Micro-warmup completado: {micro_result['duration_actual_sec']:.1f}s, actividades: {micro_result['activities_completed']}")
-                            if micro_result.get("popups_detected"):
-                                logger.warning(f"   ⚠️ Popups detectados: {micro_result['popups_detected']}")
-                        else:
-                            logger.warning(f"   ⚠️ Micro-warmup con errores: {micro_result.get('error', 'Unknown error')}")
-                            
-                    except Exception as e:
-                        logger.error(f"   ❌ Error en micro-warmup: {e}")
 
             except Exception as e:
                 dm_send_success = False
@@ -667,7 +670,7 @@ async def _run_outreach_impl(
                         },
                     })
 
-            # 8. Descansos (Delays y Batching)
+            # 9. Descansos (Delays y Batching)
             if i < len(leads) - 1:
                 # Descanso largo entre batches
                 if (i + 1) % batch_size == 0:

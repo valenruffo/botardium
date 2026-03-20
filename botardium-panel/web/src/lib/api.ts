@@ -70,8 +70,12 @@ export const apiFetch = async (input: string, init?: RequestInit): Promise<Respo
   }
   const target = /^https?:\/\//i.test(input) ? input : apiUrl(input);
   
+  const timeoutMs = init?.headers && (init.headers as Record<string, string>)['X-Timeout'] 
+    ? parseInt((init.headers as Record<string, string>)['X-Timeout'], 10) 
+    : 120000;
+  
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   
   try {
     const response = await fetch(target, {

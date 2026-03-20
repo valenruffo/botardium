@@ -4,7 +4,7 @@ import React, { useState } from 'react'
 import { Search, Sparkles, Target, ArrowRight } from 'lucide-react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { toast } from 'sonner'
-import { apiUrl } from '@/lib/api'
+import { apiFetch } from '@/lib/api'
 
 type StrategyResult = {
     sources: Array<{
@@ -54,7 +54,7 @@ export function MagicBox({
         setIsLoading(true)
         try {
             // LLamada a FastAPI Backend
-            const res = await fetch(apiUrl('/api/ai/strategy'), {
+            const res = await apiFetch('/api/ai/strategy', {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ prompt, workspace_id: workspaceId })

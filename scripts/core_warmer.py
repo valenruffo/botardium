@@ -538,6 +538,23 @@ async def run_micro_warmup(page, account_profile: dict, duration_min: float = 3.
     return result
 
 
+async def run_pre_dm_warmup(page, account_profile: dict, duration_seconds: float = 18.0, dry_run: bool = False) -> dict:
+    """
+    Warmup breve y obligatorio antes de abrir el composer de DM.
+
+    Reusa el motor de micro-warmup con duracion aleatoria corta.
+    """
+    seconds_floor = max(8.0, float(duration_seconds or 18.0))
+    jittered_seconds = random.uniform(seconds_floor * 0.85, seconds_floor * 1.2)
+    duration_min = max(0.12, jittered_seconds / 60.0)
+    return await run_micro_warmup(
+        page=page,
+        account_profile=account_profile,
+        duration_min=duration_min,
+        dry_run=dry_run,
+    )
+
+
 # --------------------------------------------------------------------------- #
 #  Capitalización (Compound)
 # --------------------------------------------------------------------------- #

@@ -734,6 +734,12 @@ def init_db():
         cursor.execute("ALTER TABLE ig_accounts ADD COLUMN session_warmup_last_run_at TEXT")
     if "session_warmup_phase" not in account_columns:
         cursor.execute("ALTER TABLE ig_accounts ADD COLUMN session_warmup_phase TEXT DEFAULT ''")
+    if "dm_phase_level" not in account_columns:
+        cursor.execute("ALTER TABLE ig_accounts ADD COLUMN dm_phase_level INTEGER DEFAULT 1")
+    if "dm_phase_streak_days" not in account_columns:
+        cursor.execute("ALTER TABLE ig_accounts ADD COLUMN dm_phase_streak_days INTEGER DEFAULT 0")
+    if "dm_phase_last_valid_date" not in account_columns:
+        cursor.execute("ALTER TABLE ig_accounts ADD COLUMN dm_phase_last_valid_date TEXT")
     if "last_outreach_result" not in lead_columns:
         cursor.execute("ALTER TABLE leads ADD COLUMN last_outreach_result TEXT")
     if "last_outreach_error" not in lead_columns:
@@ -942,6 +948,7 @@ class EmergencyStopResult(BaseModel):
     message: str
     campaigns_stopped: int
     warmups_stopped: int
+    outreach_stopped: int
     emergency_flag_set: bool
 
 
@@ -1066,6 +1073,7 @@ CAMPAIGN_STORE: Dict[str, Dict[str, Any]] = {}
 CAMPAIGN_TASKS: Dict[str, asyncio.Task] = {}
 ACCOUNT_WARMUP_TASKS: Dict[int, asyncio.Task] = {}
 MESSAGE_JOB_STORE: Dict[str, Dict[str, Any]] = {}
+OUTREACH_TASKS: Dict[str, asyncio.Task] = {}  # Track outreach job tasks for cancellation
 
 
 def _persist_campaign(campaign: Dict[str, Any]) -> None:
@@ -1100,7 +1108,10 @@ def _mark_message_job_failed(job_id: str, error_message: str, conn: sqlite3.Conn
     job = MESSAGE_JOB_STORE.get(job_id)
     if not job:
         return
+    _normalize_message_job(job)
     job["status"] = "error"
+    job["pause_reason"] = None
+    job["paused_by_limit_until"] = None
     job["current_action"] = f"Error: {error_message}"
     job["metrics"]["errors"] = job.get("metrics", {}).get("errors", 0) + 1
     job.setdefault("logs", []).insert(0, {
@@ -1112,6 +1123,7 @@ def _mark_message_job_failed(job_id: str, error_message: str, conn: sqlite3.Conn
 
 
 def _persist_message_job(job: Dict[str, Any], conn: sqlite3.Connection | None = None) -> None:
+    normalized = _normalize_message_job(job)
     own_conn = False
     if conn is None:
         conn = _connect_db()
@@ -1124,9 +1136,9 @@ def _persist_message_job(job: Dict[str, Any], conn: sqlite3.Connection | None = 
         ON CONFLICT(id) DO UPDATE SET workspace_id = excluded.workspace_id, payload = excluded.payload, updated_at = excluded.updated_at
         """,
         (
-            job["id"],
-            int(job.get("workspace_id") or 0),
-            json.dumps(job, ensure_ascii=False),
+            normalized["id"],
+            int(normalized.get("workspace_id") or 0),
+            json.dumps(normalized, ensure_ascii=False),
             datetime.now().isoformat(),
         ),
     )
@@ -1156,10 +1168,7 @@ def _load_persisted_runtime_state() -> None:
             job = json.loads(str(row["payload"] or "{}"))
             if not job.get("id"):
                 continue
-            if job.get("status") in {"queued", "running"}:
-                job["status"] = "error"
-                job["current_action"] = "Botardium se reinicio antes de terminar este job."
-            MESSAGE_JOB_STORE[str(job["id"])] = job
+            MESSAGE_JOB_STORE[str(job["id"])] = _normalize_message_job(job)
         except Exception:
             continue
     conn.close()
@@ -1180,7 +1189,10 @@ def _workspace_campaigns(workspace_id: int) -> List[Dict[str, Any]]:
 
 
 def _workspace_jobs(workspace_id: int) -> List[Dict[str, Any]]:
-    return [job for job in MESSAGE_JOB_STORE.values() if int(job.get("workspace_id") or 0) == int(workspace_id)]
+    jobs = [job for job in MESSAGE_JOB_STORE.values() if int(job.get("workspace_id") or 0) == int(workspace_id)]
+    for job in jobs:
+        _normalize_message_job(job)
+    return jobs
 
 
 def _count_leads() -> int:
@@ -1240,9 +1252,34 @@ def _requires_account_warmup(row: Dict[str, Any]) -> bool:
 def _serialize_account(row: sqlite3.Row | Dict[str, Any]) -> Dict[str, Any]:
     data = dict(row)
     runtime_profile = _build_runtime_account_profile(data)
+    sent_last_24h = int(data.get("daily_dm_sent") or 0)
     if data.get("id"):
-        data["daily_dm_sent"] = _sent_last_24h(int(data["id"]))
+        sent_last_24h = _sent_last_24h(int(data["id"]))
+    data["daily_dm_sent"] = sent_last_24h
     data["daily_dm_limit"] = int(runtime_profile.get("max_dms_per_day", data.get("daily_dm_limit") or 20))
+    data["capacity_24h"] = _capacity_24h_for_account(data, sent_last_24h)
+    action_delay_dm = runtime_profile.get("action_delay_dm") or {}
+    data["policy"] = {
+        "profile": str(runtime_profile.get("type") or _profile_key_from_account_type(str(data.get("account_type") or "mature"))),
+        "max_dms_per_day": int(runtime_profile.get("max_dms_per_day", data.get("daily_dm_limit") or 20)),
+        "max_dms_cap": int(runtime_profile.get("max_dms_cap", runtime_profile.get("max_dms_per_day", data.get("daily_dm_limit") or 20))),
+        "scale_increment_dms": int(runtime_profile.get("scale_increment_dms", 0) or 0),
+        "scale_increment_every_days": int(runtime_profile.get("scale_increment_every_days", 0) or 0),
+        "dm_delay_min_seconds": int(action_delay_dm.get("min", 120) or 120),
+        "dm_delay_max_seconds": int(action_delay_dm.get("max", 480) or 480),
+        "dm_block_size": int(runtime_profile.get("dm_block_size", 10) or 10),
+        "dm_block_pause_min_minutes": int(runtime_profile.get("dm_block_pause_min", 60) or 60),
+        "dm_block_pause_max_minutes": int(runtime_profile.get("dm_block_pause_max", 90) or 90),
+        "pre_dm_warmup_seconds_min": int(runtime_profile.get("pre_dm_warmup_seconds_min", 25) or 25),
+        "pre_dm_warmup_seconds_max": int(runtime_profile.get("pre_dm_warmup_seconds_max", 55) or 55),
+        "session_warmup_required": bool(runtime_profile.get("session_warmup_required", True)),
+        "limit_pause_window_seconds": int(_message_limit_policy(data, sent_last_24h).get("pause_window_seconds") or 0),
+        "phase_level": int(runtime_profile.get("phase_level", 1) or 1),
+        "phase_streak_days": int(runtime_profile.get("phase_streak_days", 0) or 0),
+        "phase_days_required": int(runtime_profile.get("phase_days_required", 3) or 3),
+        "phase_next_cap": runtime_profile.get("phase_next_cap"),
+        "phase_remaining_days": int(runtime_profile.get("phase_remaining_days", 0) or 0),
+    }
     data["warmup_required"] = bool(data.get("warmup_required", 0))
     data["health_score"] = _compute_health_score(data)
     data["is_busy"] = data.get("warmup_status") == "running"
@@ -1271,14 +1308,15 @@ def _build_runtime_account_profile(account: Dict[str, Any]) -> Dict[str, Any]:
     }
     profile = calculate_scaled_limits(base, existing)
     profile["ig_username"] = account.get("ig_username")
-    stored_limit = int(account.get("daily_dm_limit") or 0)
-    scaled_limit = int(profile.get("max_dms_per_day", 20))
-    if str(account.get("account_type") or "mature") == "mature" and stored_limit == 35:
-        profile["max_dms_per_day"] = scaled_limit
-    elif stored_limit > 0:
-        profile["max_dms_per_day"] = min(stored_limit, int(profile.get("max_dms_cap", 50)))
-    else:
-        profile["max_dms_per_day"] = scaled_limit
+    limit_profile = _limit_profile_for_account(account)
+    phase = _current_phase_for_account(account, limit_profile)
+    phase_cap = int(phase.get("current_cap") or profile.get("max_dms_per_day", 20))
+    profile["max_dms_per_day"] = phase_cap
+    profile["phase_level"] = int(phase.get("level") or 1)
+    profile["phase_streak_days"] = int(phase.get("streak_days") or 0)
+    profile["phase_days_required"] = int(phase.get("days_required") or 3)
+    profile["phase_next_cap"] = phase.get("next_cap")
+    profile["phase_remaining_days"] = int(phase.get("remaining_days") or 0)
     return profile
 
 
@@ -1317,6 +1355,120 @@ def _sent_last_24h(account_id: int) -> int:
     count = int(cursor.fetchone()[0])
     conn.close()
     return count
+
+
+def _sent_today_local(account_id: int) -> int:
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.execute("PRAGMA busy_timeout = 10000")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT COUNT(*)
+        FROM leads
+        WHERE ig_account_id = ?
+          AND sent_at IS NOT NULL
+          AND DATE(sent_at, 'localtime') = DATE('now', 'localtime')
+        """,
+        (account_id,),
+    )
+    count = int(cursor.fetchone()[0] or 0)
+    conn.close()
+    return count
+
+
+def _phase_caps_for_profile(profile: str) -> List[int]:
+    normalized = (profile or "personal").strip().lower()
+    if normalized == "new":
+        return [10, 15, 20, 30]
+    if normalized == "rehab":
+        return [8, 11, 14, 20]
+    return [40, 43, 46, 50]
+
+
+def _current_phase_for_account(account: Dict[str, Any], profile: str) -> Dict[str, Any]:
+    caps = _phase_caps_for_profile(profile)
+    total_levels = len(caps)
+    level = int(account.get("dm_phase_level") or 1)
+    level = min(max(1, level), total_levels)
+    idx = level - 1
+    days_required = 3
+    streak = max(0, int(account.get("dm_phase_streak_days") or 0))
+    return {
+        "level": level,
+        "total_levels": total_levels,
+        "current_cap": caps[idx],
+        "next_cap": caps[idx + 1] if idx + 1 < total_levels else None,
+        "streak_days": streak,
+        "days_required": days_required,
+        "remaining_days": max(0, days_required - streak),
+        "last_valid_date": account.get("dm_phase_last_valid_date"),
+        "caps": caps,
+    }
+
+
+def _update_phase_progress_for_account(account_id: int) -> Dict[str, Any]:
+    account = _get_account(account_id)
+    if not account:
+        return {"event": "none"}
+
+    profile = _limit_profile_for_account(account)
+    phase = _current_phase_for_account(account, profile)
+    today = datetime.now().date().isoformat()
+    last_valid = str(account.get("dm_phase_last_valid_date") or "")
+    sent_today = _sent_today_local(account_id)
+    current_cap = int(phase["current_cap"])
+
+    streak = int(phase["streak_days"])
+    level = int(phase["level"])
+    total_levels = int(phase["total_levels"])
+    days_required = int(phase["days_required"])
+
+    event: Dict[str, Any] = {"event": "none"}
+
+    if sent_today >= current_cap:
+        if last_valid != today:
+            streak += 1
+            last_valid = today
+            event = {
+                "event": "streak_day_completed",
+                "streak_days": streak,
+                "days_required": days_required,
+                "current_cap": current_cap,
+            }
+            if streak >= days_required and level < total_levels:
+                previous_level = level
+                level += 1
+                streak = 0
+                event = {
+                    "event": "phase_up",
+                    "from_level": previous_level,
+                    "to_level": level,
+                    "new_cap": int(_phase_caps_for_profile(profile)[level - 1]),
+                }
+    else:
+        if last_valid != today:
+            streak = 0
+
+    caps = _phase_caps_for_profile(profile)
+    new_limit = int(caps[level - 1])
+
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.execute("PRAGMA busy_timeout = 10000")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE ig_accounts
+        SET dm_phase_level = ?,
+            dm_phase_streak_days = ?,
+            dm_phase_last_valid_date = ?,
+            daily_dm_limit = ?
+        WHERE id = ?
+        """,
+        (level, streak, last_valid or None, new_limit, account_id),
+    )
+    conn.commit()
+    conn.close()
+    return event
 
 
 def _estimate_account_send_window(account_id: int, lead_count: int) -> tuple[int, int]:
@@ -1362,6 +1514,200 @@ def _estimate_account_send_window(account_id: int, lead_count: int) -> tuple[int
         max_per_lead = max(min_per_lead + 15, min(int(fallback_max_per_lead * 1.4), p75))
 
     return (lead_count * min_per_lead, lead_count * max_per_lead)
+
+
+def _limit_profile_for_account(account: Dict[str, Any]) -> str:
+    account_type = str(account.get("account_type") or "mature").strip().lower()
+    if account_type == "new":
+        return "new"
+    if account_type == "rehab":
+        return "rehab"
+    return "personal"
+
+
+def _is_rehab_stable(account: Dict[str, Any]) -> bool:
+    completed = int(account.get("account_warmup_days_completed") or 0)
+    total = max(1, int(account.get("account_warmup_days_total") or 0))
+    health_score = int(account.get("health_score") or 0)
+    has_recent_error = bool(str(account.get("last_error") or "").strip())
+    return completed >= total and health_score >= 80 and not has_recent_error
+
+
+def _limit_pause_window_seconds(account: Dict[str, Any], profile: str) -> int:
+    if profile == "new":
+        return 24 * 3600
+    if profile == "rehab":
+        return 24 * 3600 if _is_rehab_stable(account) else 48 * 3600
+    return 12 * 3600
+
+
+def _message_limit_policy(account: Dict[str, Any], used_last_24h: int) -> Dict[str, Any]:
+    profile = _limit_profile_for_account(account)
+    phase = _current_phase_for_account(account, profile)
+    cap = int(phase["current_cap"])
+    used = max(0, int(used_last_24h or 0))
+    pause_window_seconds = _limit_pause_window_seconds(account, profile)
+    percent = int(min(100, round((used / max(cap, 1)) * 100)))
+    return {
+        "profile": profile,
+        "used": used,
+        "cap": cap,
+        "pause_window_seconds": pause_window_seconds,
+        "percent": percent,
+        "phase": phase,
+    }
+
+
+def _capacity_24h_from_limit_policy(limit_policy: Dict[str, Any]) -> Dict[str, Any]:
+    used = max(0, int(limit_policy.get("used") or 0))
+    cap = max(1, int(limit_policy.get("cap") or 50))
+    percent = int(limit_policy.get("percent") or min(100, round((used / cap) * 100)))
+    pause_window_seconds = max(0, int(limit_policy.get("pause_window_seconds") or 0))
+    profile = str(limit_policy.get("profile") or "personal")
+    return {
+        "used": used,
+        "cap": cap,
+        "remaining": max(0, cap - used),
+        "percent": max(0, min(100, percent)),
+        "profile": profile,
+        "pause_window_seconds": pause_window_seconds,
+        "window_seconds": 24 * 3600,
+        "phase": limit_policy.get("phase") if isinstance(limit_policy.get("phase"), dict) else None,
+    }
+
+
+def _capacity_24h_for_account(account: Dict[str, Any], used_last_24h: Optional[int] = None) -> Dict[str, Any]:
+    if used_last_24h is None:
+        account_id = int(account.get("id") or 0)
+        used_last_24h = _sent_last_24h(account_id) if account_id > 0 else int(account.get("daily_dm_sent") or 0)
+    policy = _message_limit_policy(account, int(used_last_24h or 0))
+    return _capacity_24h_from_limit_policy(policy)
+
+
+def _capacity_24h_for_job_payload(job: Dict[str, Any]) -> Dict[str, Any]:
+    explicit = job.get("capacity_24h")
+    if isinstance(explicit, dict):
+        return _capacity_24h_from_limit_policy(explicit)
+
+    limit_data = job.get("limit")
+    if isinstance(limit_data, dict):
+        return _capacity_24h_from_limit_policy(limit_data)
+
+    legacy_policy = {
+        "used": job.get("limit_used", 0),
+        "cap": job.get("limit_cap", 50),
+        "pause_window_seconds": job.get("limit_pause_window_seconds", 12 * 3600),
+        "percent": job.get("limit_percent", 0),
+        "profile": job.get("limit_profile", "personal"),
+    }
+    return _capacity_24h_from_limit_policy(legacy_policy)
+
+
+def _resume_eta_seconds(job: Dict[str, Any]) -> Optional[int]:
+    paused_until = str(job.get("paused_by_limit_until") or "").strip()
+    if not paused_until:
+        return None
+    try:
+        remaining = int((datetime.fromisoformat(paused_until) - datetime.now()).total_seconds())
+    except Exception:
+        return None
+    return max(0, remaining)
+
+
+def _normalize_message_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    if "pause_reason" not in job:
+        job["pause_reason"] = None
+    if "paused_by_limit_until" not in job:
+        job["paused_by_limit_until"] = None
+    if "limit" not in job or not isinstance(job.get("limit"), dict):
+        job["limit"] = {
+            "profile": "personal",
+            "used": 0,
+            "cap": 50,
+            "pause_window_seconds": 12 * 3600,
+            "percent": 0,
+        }
+    else:
+        limit = job["limit"]
+        limit.setdefault("profile", "personal")
+        limit.setdefault("used", 0)
+        limit.setdefault("cap", 50)
+        limit.setdefault("pause_window_seconds", 12 * 3600)
+        used = max(0, int(limit.get("used") or 0))
+        cap = max(1, int(limit.get("cap") or 50))
+        limit["used"] = used
+        limit["cap"] = cap
+        limit["percent"] = int(min(100, round((used / cap) * 100)))
+    job["capacity_24h"] = _capacity_24h_for_job_payload(job)
+    job.setdefault("phase_event", None)
+    job.setdefault("lead_ids_pending", [])
+    job.setdefault("dry_run", False)
+    job.setdefault("account_id", None)
+    return job
+
+
+def _set_job_paused_by_limit(job: Dict[str, Any], reason_message: str) -> None:
+    normalized = _normalize_message_job(job)
+    pause_window = int(normalized.get("limit", {}).get("pause_window_seconds") or (12 * 3600))
+    pause_until = datetime.fromtimestamp(time.time() + pause_window).isoformat()
+    normalized["status"] = "paused"
+    normalized["pause_reason"] = "limit_cap_hit"
+    normalized["paused_by_limit_until"] = pause_until
+    normalized["current_lead"] = None
+    normalized["eta_seconds"] = 0
+    normalized["eta_min_seconds"] = 0
+    normalized["eta_max_seconds"] = 0
+    normalized["current_action"] = reason_message
+    normalized.setdefault("logs", []).insert(0, {
+        "message": reason_message,
+        "timestamp": int(time.time()),
+    })
+    normalized["logs"] = normalized["logs"][:12]
+
+
+def _auto_resume_paused_by_limit_jobs(workspace_id: int) -> None:
+    jobs = _workspace_jobs(workspace_id)
+    for job in jobs:
+        normalized = _normalize_message_job(job)
+        if normalized.get("kind") != "outreach":
+            continue
+        if normalized.get("status") != "paused":
+            continue
+        if normalized.get("pause_reason") != "limit_cap_hit":
+            continue
+        eta = _resume_eta_seconds(normalized)
+        if eta is None or eta > 0:
+            continue
+        pending = [int(lead_id) for lead_id in (normalized.get("lead_ids_pending") or []) if int(lead_id) > 0]
+        if not pending:
+            normalized["status"] = "completed"
+            normalized["pause_reason"] = None
+            normalized["paused_by_limit_until"] = None
+            normalized["current_action"] = "Outreach completado tras pausa por límite diario."
+            _persist_message_job(normalized)
+            continue
+        running_task = OUTREACH_TASKS.get(str(normalized["id"]))
+        if running_task and not running_task.done():
+            continue
+        normalized["status"] = "queued"
+        normalized["pause_reason"] = None
+        normalized["paused_by_limit_until"] = None
+        normalized["current_action"] = "Ventana de pausa finalizada. Reanudando outreach pendiente."
+        normalized.setdefault("logs", []).insert(0, {
+            "message": normalized["current_action"],
+            "timestamp": int(time.time()),
+        })
+        normalized["logs"] = normalized["logs"][:12]
+        _persist_message_job(normalized)
+        task = asyncio.create_task(
+            _run_message_outreach_job(
+                str(normalized["id"]),
+                pending,
+                bool(normalized.get("dry_run")),
+                normalized.get("campaign_id"),
+            )
+        )
+        OUTREACH_TASKS[str(normalized["id"])] = task
 
 
 def _update_account_runtime(account_id: int, **fields: Any) -> None:
@@ -2168,23 +2514,38 @@ def _bundle_for_lead_with_payload(lead: Dict[str, Any], payload: MessageStudioRe
 
 
 def _serialize_message_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_message_job(job)
+    resume_eta = _resume_eta_seconds(normalized)
+    capacity_24h = _capacity_24h_for_job_payload(normalized)
     return {
-        "id": job["id"],
-        "kind": job.get("kind", "prepare"),
-        "status": job["status"],
-        "progress": job["progress"],
-        "campaign_id": job.get("campaign_id"),
-        "prompt": job["prompt"],
-        "created_at": job["created_at"],
-        "current_action": job["current_action"],
-        "total": job["total"],
-        "processed": job["processed"],
-        "current_lead": job.get("current_lead"),
-        "eta_seconds": job.get("eta_seconds"),
-        "eta_min_seconds": job.get("eta_min_seconds"),
-        "eta_max_seconds": job.get("eta_max_seconds"),
-        "metrics": job.get("metrics", {}),
-        "logs": job.get("logs", []),
+        "id": normalized["id"],
+        "kind": normalized.get("kind", "prepare"),
+        "status": normalized["status"],
+        "state": normalized["status"],
+        "progress": normalized["progress"],
+        "campaign_id": normalized.get("campaign_id"),
+        "prompt": normalized["prompt"],
+        "created_at": normalized["created_at"],
+        "current_action": normalized["current_action"],
+        "total": normalized["total"],
+        "processed": normalized["processed"],
+        "current_lead": normalized.get("current_lead"),
+        "eta_seconds": normalized.get("eta_seconds"),
+        "eta_min_seconds": normalized.get("eta_min_seconds"),
+        "eta_max_seconds": normalized.get("eta_max_seconds"),
+        "pause_reason": normalized.get("pause_reason"),
+        "paused_by_limit_until": normalized.get("paused_by_limit_until"),
+        "resume_eta_seconds": resume_eta,
+        "limit": normalized.get("limit", {}),
+        "capacity_24h": capacity_24h,
+        "limit_profile": normalized.get("limit", {}).get("profile"),
+        "limit_used": normalized.get("limit", {}).get("used"),
+        "limit_cap": normalized.get("limit", {}).get("cap"),
+        "limit_pause_window_seconds": normalized.get("limit", {}).get("pause_window_seconds"),
+        "limit_percent": normalized.get("limit", {}).get("percent"),
+        "phase_event": normalized.get("phase_event"),
+        "metrics": normalized.get("metrics", {}),
+        "logs": normalized.get("logs", []),
     }
 
 
@@ -2194,10 +2555,14 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
     job = MESSAGE_JOB_STORE.get(job_id)
     if not job:
         return
+    _normalize_message_job(job)
+    initial_limit_used = int(job.get("limit", {}).get("used") or 0)
+    previously_pending = [int(lead_id) for lead_id in (job.get("lead_ids_pending") or []) if int(lead_id) > 0]
 
     main_loop = asyncio.get_running_loop()
 
     async def progress_hook(update: Dict[str, Any]) -> None:
+        _normalize_message_job(job)
         job["status"] = str(update.get("status") or job["status"])
         job["progress"] = int(update.get("progress") or job["progress"])
         job["current_action"] = str(update.get("current_action") or job["current_action"])
@@ -2226,6 +2591,12 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
             merged = dict(job.get("metrics") or {})
             merged.update(update.get("metrics") or {})
             job["metrics"] = merged
+            if isinstance(job.get("limit"), dict):
+                sent_now = int(merged.get("sent") or 0)
+                cap_now = max(1, int(job["limit"].get("cap") or 50))
+                used_now = max(0, initial_limit_used + sent_now)
+                job["limit"]["used"] = used_now
+                job["limit"]["percent"] = int(min(100, round((used_now / cap_now) * 100)))
         if update.get("current_action"):
             job.setdefault("logs", []).insert(0, {
                 "message": job["current_action"],
@@ -2236,6 +2607,8 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
 
     try:
         job["status"] = "running"
+        job["pause_reason"] = None
+        job["paused_by_limit_until"] = None
         job["current_action"] = "Calentando sesion y preparando envio real."
 
         # Uvicorn runs on a SelectorEventLoop on Windows, breaking Patchright's subprocess requirement.
@@ -2268,22 +2641,63 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
 
         result = await asyncio.to_thread(_run_isolated_outreach)
 
-        job["status"] = "completed"
-        job["progress"] = 100
-        job["processed"] = int(result.get("processed") or 0)
-        job["total"] = max(int(result.get("processed") or 0), int(job.get("total") or 0))
+        account_id = int(job.get("account_id") or 0)
+        if account_id > 0:
+            phase_event = _update_phase_progress_for_account(account_id)
+            if isinstance(phase_event, dict) and phase_event.get("event") and phase_event.get("event") != "none":
+                job["phase_event"] = phase_event
+            refreshed_account = _get_account(account_id)
+            if refreshed_account:
+                refreshed_used = _sent_last_24h(account_id)
+                refreshed_policy = _message_limit_policy(refreshed_account, refreshed_used)
+                job["limit"] = {
+                    "profile": refreshed_policy.get("profile"),
+                    "used": int(refreshed_policy.get("used") or 0),
+                    "cap": int(refreshed_policy.get("cap") or 50),
+                    "pause_window_seconds": int(refreshed_policy.get("pause_window_seconds") or 0),
+                    "percent": int(refreshed_policy.get("percent") or 0),
+                    "phase": refreshed_policy.get("phase"),
+                }
+
+        sent = int(result.get("sent") or 0)
+        processed = int(result.get("processed") or 0)
+        previous_total = int(job.get("total") or 0)
+        job["processed"] = processed
+        job["total"] = max(processed, previous_total)
+        remaining_from_batch = [int(lead_id) for lead_id in lead_ids[min(processed, len(lead_ids)):]]
+        trailing_pending = [lead_id for lead_id in previously_pending if lead_id not in lead_ids]
+        remaining_pending = remaining_from_batch + trailing_pending
+        job["lead_ids_pending"] = remaining_pending
+
+        if processed == 0 and sent == 0 and previous_total > 0:
+            job["status"] = "error"
+            job["progress"] = 0
+            job["current_action"] = "Outreach cancelado: no habia leads elegibles para enviar en esta ejecucion."
+        elif remaining_pending:
+            _set_job_paused_by_limit(
+                job,
+                "Se alcanzó el tope de mensajes de la ventana 24h. Reanudaremos automáticamente al abrirse la próxima ventana segura.",
+            )
+        else:
+            job["status"] = "completed"
+            job["progress"] = 100
         job["current_lead"] = None
         job["eta_seconds"] = 0
         job["eta_min_seconds"] = 0
         job["eta_max_seconds"] = 0
-        sent = int(result.get("sent") or 0)
         job["metrics"] = {
             "sent": sent,
             "errors": int(result.get("errors") or 0),
             "blocked": int(result.get("blocked") or 0),
             "no_dm_button": int(result.get("no_dm_button") or 0),
         }
-        job["current_action"] = f"Outreach completado. {sent} DM(s) enviados{' en dry run' if dry_run else ''}."
+        if isinstance(job.get("limit"), dict):
+            cap_now = max(1, int(job["limit"].get("cap") or 50))
+            used_now = max(0, initial_limit_used + sent)
+            job["limit"]["used"] = used_now
+            job["limit"]["percent"] = int(min(100, round((used_now / cap_now) * 100)))
+        if not (processed == 0 and sent == 0 and previous_total > 0) and job.get("status") != "paused":
+            job["current_action"] = f"Outreach completado. {sent} DM(s) enviados{' en dry run' if dry_run else ''}."
         job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
         _persist_message_job(job)
     except Exception as exc:
@@ -2293,6 +2707,8 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
         job["status"] = "error"
         job["progress"] = 0
         job["current_lead"] = None
+        job["pause_reason"] = None
+        job["paused_by_limit_until"] = None
         job["current_action"] = f"Error en outreach: {exc}"[:150]
         job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time()), "details": err_str})
         _persist_message_job(job)
@@ -2995,6 +3411,16 @@ async def relogin_account(account_id: int, request: Request):
             warmup_progress=0,
             session_warmup_phase="idle",
         )
+        # Persist to DB - update session_warmup_last_run_at to NOW so requires_session_warmup returns False
+        from datetime import datetime
+        conn = _connect_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE ig_accounts SET session_status = ?, warmup_status = ?, last_error = ?, current_action = ?, session_warmup_last_run_at = ? WHERE id = ?",
+            ("verified", "idle", "", "Sesion revalidada. Cuenta lista para warmup de sesion.", datetime.now().isoformat(), account_id),
+        )
+        conn.commit()
+        conn.close()
         _audit_event("account.relogin", actor, actor.workspace_id, "allowed", "account", resource_id=str(account_id))
         return {"status": "ok", "account_id": account_id, "ig_username": expected_username}
     except HTTPException as exc:
@@ -3382,15 +3808,17 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
 
 @app.post("/api/emergency/stop-all")
 async def emergency_stop_all(request: Request):
-    """🚨 Detener todo: Cancela todas las campanas y calentamientos de cuenta."""
+    """🚨 Detener todo: Cancela todas las campanas, calentamientos y envíos de DM."""
     from scripts.outreach_manager import EMERGENCY_FLAG
     
     actor = _require_actor(request)
     
     campaigns_stopped = 0
     warmups_stopped = 0
+    outreach_stopped = 0
     
     try:
+        # 1. Stop all campaign tasks
         for campaign_id in list(CAMPAIGN_TASKS.keys()):
             task = CAMPAIGN_TASKS.get(campaign_id)
             if task and not task.done():
@@ -3410,6 +3838,7 @@ async def emergency_stop_all(request: Request):
             
             campaigns_stopped += 1
         
+        # 2. Stop all account warmup tasks
         for account_id in list(ACCOUNT_WARMUP_TASKS.keys()):
             task = ACCOUNT_WARMUP_TASKS.get(account_id)
             if task and not task.done():
@@ -3433,14 +3862,38 @@ async def emergency_stop_all(request: Request):
             
             warmups_stopped += 1
         
+        # 3. Stop all message/outreach jobs (in-memory tasks)
+        for job_id in list(OUTREACH_TASKS.keys()):
+            task = OUTREACH_TASKS.get(job_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+            
+            job = MESSAGE_JOB_STORE.get(job_id)
+            if job:
+                job["status"] = "stopped"
+                job["current_action"] = "Detenido por emergencia (operador)"
+                job.setdefault("logs", []).insert(0, {"message": "🚨 Parada de emergencia ejecutada", "timestamp": int(time.time())})
+                _persist_message_job(job)
+            
+            _audit_event("emergency.stop_outreach", actor, actor.workspace_id, "allowed", "message_job", resource_id=job_id)
+            outreach_stopped += 1
+        
+        # 4. Create emergency flag for outreach manager
         EMERGENCY_FLAG.touch()
-        _audit_event("emergency.stop_all", actor, actor.workspace_id, "allowed", "system", detail=f"Stopped {campaigns_stopped} campaigns, {warmups_stopped} warmups")
+        
+        # 5. Audit log
+        _audit_event("emergency.stop_all", actor, actor.workspace_id, "allowed", "system", detail=f"Stopped {campaigns_stopped} campaigns, {warmups_stopped} warmups, {outreach_stopped} outreach jobs")
         
         return EmergencyStopResult(
             status="success",
-            message=f"🚨 Emergencia ejecutada: {campaigns_stopped} campanas y {warmups_stopped} calentamientos detenidos.",
+            message=f"🚨 Emergencia ejecutada: {campaigns_stopped} campanas, {warmups_stopped} calentamientos y {outreach_stopped} envíos detenidos.",
             campaigns_stopped=campaigns_stopped,
             warmups_stopped=warmups_stopped,
+            outreach_stopped=outreach_stopped,
             emergency_flag_set=True,
         )
     
@@ -3886,7 +4339,7 @@ async def run_message_queue(payload: MessageRunRequest, request: Request):
     if payload.campaign_id:
         query += " AND campaign_id = ?"
         params.append(payload.campaign_id)
-    query += " ORDER BY created_at ASC LIMIT 50"
+    query += " ORDER BY created_at ASC LIMIT 100"
     cursor.execute(query, params)
     lead_ids = [int(row["id"]) for row in cursor.fetchall()]
     window_start = datetime.fromtimestamp(time.time() - 86400).isoformat()
@@ -3895,37 +4348,46 @@ async def run_message_queue(payload: MessageRunRequest, request: Request):
         (payload.account_id, window_start),
     )
     sent_last_24h = int(cursor.fetchone()[0])
-    daily_limit = int(account.get("daily_dm_limit") or 35)
-    remaining = max(0, daily_limit - sent_last_24h)
-    if remaining <= 0:
-        conn.close()
-        raise HTTPException(status_code=409, detail="Ya alcanzaste el limite diario configurado. Espera unas horas antes de seguir.")
-    if len(lead_ids) > remaining:
-        lead_ids = lead_ids[:remaining]
-    if lead_ids:
-        placeholders = ",".join("?" for _ in lead_ids)
-        cursor.execute(f"UPDATE leads SET ig_account_id = ? WHERE id IN ({placeholders})", [payload.account_id, *lead_ids])
+    limit_policy = _message_limit_policy(account, sent_last_24h)
+    cap = int(limit_policy["cap"])
+    remaining = max(0, cap - sent_last_24h)
+    all_candidate_ids = list(lead_ids)
+    send_now_ids = all_candidate_ids[:remaining] if remaining > 0 else []
+    pending_limit_ids = all_candidate_ids[len(send_now_ids):]
+    if send_now_ids:
+        placeholders = ",".join("?" for _ in send_now_ids)
+        cursor.execute(f"UPDATE leads SET ig_account_id = ? WHERE id IN ({placeholders})", [payload.account_id, *send_now_ids])
         cursor.execute("UPDATE ig_accounts SET daily_dm_sent = ? WHERE id = ?", (sent_last_24h, payload.account_id))
         conn.commit()
     conn.close()
 
-    if not lead_ids:
+    if not all_candidate_ids:
         raise HTTPException(status_code=400, detail="No hay leads listos para ejecutar outreach.")
 
+    # Clear stale emergency flag before launching a fresh outreach job.
+    # Otherwise, a previous Detener Todo leaves the flag set and new jobs
+    # abort immediately with 0 processed.
+    try:
+        from scripts.outreach_manager import EMERGENCY_FLAG
+        if EMERGENCY_FLAG.exists():
+            EMERGENCY_FLAG.unlink()
+    except Exception:
+        pass
+
     job_id = str(uuid4())
-    eta_min_seconds, eta_max_seconds = _estimate_account_send_window(payload.account_id, len(lead_ids))
+    eta_min_seconds, eta_max_seconds = _estimate_account_send_window(payload.account_id, len(send_now_ids))
     eta_seconds = max(60, int((eta_min_seconds + eta_max_seconds) / 2))
     job = {
         "id": job_id,
         "workspace_id": actor.workspace_id,
         "kind": "outreach",
-        "status": "queued",
+        "status": "queued" if send_now_ids else "paused",
         "progress": 0,
         "campaign_id": payload.campaign_id,
         "prompt": "outreach-run",
         "created_at": int(time.time()),
-        "current_action": ("Cola de envio creada. " + ("Se limitara al cupo diario restante." if remaining < len(payload.ids or lead_ids) else "" )).strip(),
-        "total": len(lead_ids),
+        "current_action": "Cola de envio creada.",
+        "total": len(all_candidate_ids),
         "processed": 0,
         "current_lead": None,
         "eta_seconds": eta_seconds,
@@ -3933,12 +4395,27 @@ async def run_message_queue(payload: MessageRunRequest, request: Request):
         "eta_max_seconds": eta_max_seconds,
         "metrics": {"sent": 0, "errors": 0, "blocked": 0, "no_dm_button": 0},
         "logs": [],
+        "account_id": payload.account_id,
+        "dry_run": payload.dry_run,
+        "lead_ids_pending": pending_limit_ids if send_now_ids else all_candidate_ids,
+        "pause_reason": None,
+        "paused_by_limit_until": None,
+        "limit": limit_policy,
+        "capacity_24h": _capacity_24h_from_limit_policy(limit_policy),
     }
+    if not send_now_ids:
+        _set_job_paused_by_limit(job, "Se alcanzó el tope de mensajes de la ventana 24h. El envío se reanudará automáticamente cuando se abra la próxima ventana.")
+    elif pending_limit_ids:
+        job["current_action"] = "Cola de envío creada. Se enviará en tramos por límite de seguridad rolling 24h."
+    else:
+        job["current_action"] = "Cola de envío creada."
     MESSAGE_JOB_STORE[job_id] = job
     _persist_message_job(job)
-    asyncio.create_task(_run_message_outreach_job(job_id, lead_ids, payload.dry_run, payload.campaign_id))
+    if send_now_ids:
+        task = asyncio.create_task(_run_message_outreach_job(job_id, send_now_ids, payload.dry_run, payload.campaign_id))
+        OUTREACH_TASKS[job_id] = task  # Track task for emergency cancellation
     _audit_event("message.run", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
-    return {"status": "started", "job": _serialize_message_job(job)}
+    return {"status": ("started" if send_now_ids else "paused"), "job": _serialize_message_job(job)}
 
 
 @app.get("/api/messages/jobs")
@@ -3950,8 +4427,120 @@ async def get_message_jobs(workspace_id: int, request: Request):
         resource_type="workspace",
         resource_id=str(workspace_id),
     )
+    _auto_resume_paused_by_limit_jobs(workspace_id)
     jobs = sorted(_workspace_jobs(workspace_id), key=lambda job: job["created_at"], reverse=True)
     return {"jobs": [_serialize_message_job(job) for job in jobs[:20]]}
+
+
+@app.post("/api/messages/jobs/{job_id}/stop")
+async def stop_message_job(job_id: str, request: Request):
+    actor = _authorize_workspace_scope(
+        request,
+        int(request.query_params.get("workspace_id") or 0),
+        action="message.job.stop",
+        resource_type="message_job",
+        resource_id=job_id,
+    )
+    
+    job = MESSAGE_JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    
+    if job.get("status") not in {"running", "queued"}:
+        raise HTTPException(status_code=400, detail="El job no está en ejecución o en cola.")
+    
+    if job_id in OUTREACH_TASKS:
+        task = OUTREACH_TASKS[job_id]
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    
+    job["status"] = "stopped"
+    job["pause_reason"] = "manual_stop"
+    job["paused_by_limit_until"] = None
+    job["current_action"] = "Job detenido manualmente por el usuario."
+    _persist_message_job(job)
+    
+    _audit_event("message.job.stop", actor, actor.workspace_id, "allowed", "message_job", resource_id=job_id)
+    
+    return {"status": "stopped", "job": _serialize_message_job(job)}
+
+
+@app.post("/api/messages/jobs/{job_id}/pause")
+async def pause_message_job(job_id: str, request: Request):
+    actor = _authorize_workspace_scope(
+        request,
+        int(request.query_params.get("workspace_id") or 0),
+        action="message.job.pause",
+        resource_type="message_job",
+        resource_id=job_id,
+    )
+    
+    job = MESSAGE_JOB_STORE.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado.")
+    
+    if job.get("status") not in {"running", "queued"}:
+        raise HTTPException(status_code=400, detail="El job no está en ejecución o en cola.")
+
+    job["status"] = "paused"
+    job["pause_reason"] = "manual_pause"
+    job["paused_by_limit_until"] = None
+    job["current_action"] = "Job pausado manualmente por el usuario. Puede ser reanudado."
+    _persist_message_job(job)
+    
+    _audit_event("message.job.pause", actor, actor.workspace_id, "allowed", "message_job", resource_id=job_id)
+    
+    return {"status": "paused", "job": _serialize_message_job(job)}
+
+
+@app.delete("/api/messages/jobs/{job_id}")
+async def delete_message_job(job_id: str, request: Request):
+    """Eliminar un job de la cola (solo si está en estado 'error' o 'stopped')."""
+    actor = _require_actor(request)
+    
+    # Try to find job in memory first
+    job = MESSAGE_JOB_STORE.get(job_id)
+    
+    # If not in memory, fetch from DB
+    if not job:
+        conn = _connect_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT payload FROM message_jobs_cache WHERE id = ?", (job_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Job no encontrado.")
+        
+        import json
+        job = json.loads(row["payload"])
+    
+    if int(job.get("workspace_id") or 0) != actor.workspace_id:
+        raise HTTPException(status_code=403, detail="No estás autorizado para eliminar este job.")
+    
+    if job.get("status") not in ("error", "stopped", "completed"):
+        raise HTTPException(status_code=400, detail="Solo se pueden eliminar jobs en estado 'error', 'stopped' o 'completed'.")
+    
+    # Eliminar de la memoria (si existe)
+    if job_id in MESSAGE_JOB_STORE:
+        del MESSAGE_JOB_STORE[job_id]
+    
+    # Eliminar de la DB
+    conn = _connect_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM message_jobs_cache WHERE id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+    
+    serialized_job = _serialize_message_job(job)
+    _audit_event("message.job.delete", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
+    return {"status": "deleted", "job_id": job_id, "job": serialized_job}
+
 
 if __name__ == "__main__":
     import uvicorn

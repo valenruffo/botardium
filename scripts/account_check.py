@@ -42,7 +42,7 @@ PROFILES = {
     "personal": {
         "type": "personal",
         "label": "Personal / Agencia (Alta Confianza)",
-        "max_dms_per_day": 20,
+        "max_dms_per_day": 40,
         "max_follows_per_day": 25,
         "max_likes_per_day": 65,
         "max_comments_per_day": 12,
@@ -61,7 +61,7 @@ PROFILES = {
         "session_max_hours": 3,
         "session_pause_hours": {"min": 1, "max": 4},
         "operating_hours": {"start": 8, "end": 23},
-        "scale_increment_dms": 5,
+        "scale_increment_dms": 3,
         "scale_increment_every_days": 3,
         "max_dms_cap": 50,
         "session_warmup_required": False,
@@ -178,24 +178,24 @@ def load_existing_profile() -> dict:
 
 def calculate_scaled_limits(profile: dict, existing: dict) -> dict:
     """
-    Para cuentas prospectoras, calcula los límites escalados
+    Calcula límites escalados según el perfil y días activos.
     basándose en el historial del perfil existente.
     """
-    if profile["type"] != "prospector":
+    profile_type = str(profile.get("type") or "").lower()
+    if profile_type not in {"prospector", "personal", "rehab"}:
         return profile
 
     # Si hay un perfil existente, revisar si se puede escalar
     days_active = existing.get("days_active", 0)
     current_max_dms = existing.get("max_dms_per_day", profile["max_dms_per_day"])
 
-    # Escalar cada 2 días, máximo 30 DMs
-    increment = profile["scale_increment_dms"]
+    increment = int(profile.get("scale_increment_dms", 0) or 0)
     if days_active > 0 and increment > 0:
         scale_every_days = int(profile.get("scale_increment_every_days", 3))
         scale_cycles = days_active // max(scale_every_days, 1)
         new_max = min(
             profile["max_dms_per_day"] + (scale_cycles * increment),
-            int(profile.get("max_dms_cap", 30)),
+            int(profile.get("max_dms_cap", profile.get("max_dms_per_day", 30))),
         )
         if new_max > current_max_dms:
             logger.info(f"📈 Escalando DMs: {current_max_dms} → {new_max} (día {days_active})")

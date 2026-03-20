@@ -9,6 +9,7 @@
     "dev:desktop": "npm run backend:build && vite",
     "build": "tsc -b && vite build",
     "build:desktop": "npm run backend:build && npm run build",
+    "start": "vite preview --port 3000",
     "preview": "vite preview",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "tauri": "tauri",

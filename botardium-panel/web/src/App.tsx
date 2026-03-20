@@ -224,6 +224,7 @@ type MessageJob = {
   id: string;
   kind?: string;
   status: string;
+  state?: string;
   progress: number;
   campaign_id?: string | null;
   prompt: string;
@@ -235,8 +236,63 @@ type MessageJob = {
   eta_seconds?: number | null;
   eta_min_seconds?: number | null;
   eta_max_seconds?: number | null;
+  pause_reason?: string | null;
+  paused_by_limit_until?: string | null;
+  resume_eta_seconds?: number | null;
+  limit?: {
+    profile?: string;
+    used?: number;
+    cap?: number;
+    pause_window_seconds?: number;
+    percent?: number;
+  };
+  capacity_24h?: {
+    used?: number;
+    cap?: number;
+    remaining?: number;
+    percent?: number;
+    profile?: string;
+    pause_window_seconds?: number;
+    window_seconds?: number;
+    phase?: Capacity24h['phase'];
+  };
+  limit_profile?: string;
+  limit_used?: number;
+  limit_cap?: number;
+  limit_pause_window_seconds?: number;
+  limit_percent?: number;
+  phase_event?: {
+    event?: string;
+    streak_days?: number;
+    days_required?: number;
+    current_cap?: number;
+    from_level?: number;
+    to_level?: number;
+    new_cap?: number;
+  } | null;
   metrics?: Record<string, number>;
   logs: { message: string; timestamp: number }[];
+};
+
+type Capacity24h = {
+  used: number;
+  cap: number;
+  remaining: number;
+  percent: number;
+  profile?: string;
+  pause_window_seconds?: number;
+  window_seconds?: number;
+  phase?: {
+    level?: number;
+    total_levels?: number;
+    current_cap?: number;
+    next_cap?: number | null;
+    streak_days?: number;
+    days_required?: number;
+    remaining_days?: number;
+    last_valid_date?: string | null;
+    caps?: number[];
+  };
 };
 
 const formatDuration = (seconds: number) => {
@@ -252,6 +308,18 @@ const formatDurationRange = (minSeconds?: number | null, maxSeconds?: number | n
   const clampedMin = Math.max(1, minSeconds);
   const clampedMax = Math.max(clampedMin, maxSeconds);
   return `Tiempo estimado: ${formatDuration(clampedMin)} - ${formatDuration(clampedMax)}`;
+};
+
+const formatOperationalRange = (minSeconds?: number | null, maxSeconds?: number | null) => {
+  if (typeof minSeconds !== 'number' || typeof maxSeconds !== 'number' || minSeconds <= 0 || maxSeconds <= 0) return '--';
+  const clampedMin = Math.max(1, Math.round(minSeconds));
+  const clampedMax = Math.max(clampedMin, Math.round(maxSeconds));
+  if (clampedMax <= 120) {
+    return clampedMin === clampedMax ? `${clampedMin}s` : `${clampedMin}-${clampedMax}s`;
+  }
+  const minLabel = formatDuration(clampedMin);
+  const maxLabel = formatDuration(clampedMax);
+  return minLabel === maxLabel ? minLabel : `${minLabel} - ${maxLabel}`;
 };
 
 const estimateSendEtaRangeSeconds = (leadCount: number, activeAccountId?: number | null, leads: Lead[] = []) => {
@@ -294,7 +362,78 @@ const formatJobStatusLabel = (status: string) => {
   if (status === 'running') return 'En curso';
   if (status === 'queued') return 'En cola';
   if (status === 'error') return 'Error';
+  if (status === 'stopped') return 'Detenido';
+  if (status === 'paused') return 'Pausado';
   return status;
+};
+
+const isPausedByLimit = (job: MessageJob) => job.status === 'paused' && job.pause_reason === 'limit_cap_hit';
+
+const normalizeCapacity24h = (value: Partial<Capacity24h> | null | undefined): Capacity24h | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const usedRaw = Number(value.used);
+  const capRaw = Number(value.cap);
+  if (!Number.isFinite(usedRaw) || !Number.isFinite(capRaw) || capRaw <= 0) return undefined;
+  const used = Math.max(0, Math.round(usedRaw));
+  const cap = Math.max(1, Math.round(capRaw));
+  const remaining = Number.isFinite(Number(value.remaining))
+    ? Math.max(0, Math.round(Number(value.remaining)))
+    : Math.max(0, cap - used);
+  const percent = Number.isFinite(Number(value.percent))
+    ? Math.max(0, Math.min(100, Math.round(Number(value.percent))))
+    : Math.min(100, Math.round((used / cap) * 100));
+  const pauseWindow = Number.isFinite(Number(value.pause_window_seconds)) ? Math.max(0, Math.round(Number(value.pause_window_seconds))) : undefined;
+  const windowSeconds = Number.isFinite(Number(value.window_seconds)) ? Math.max(0, Math.round(Number(value.window_seconds))) : undefined;
+  const rawPhase = (value as { phase?: Capacity24h['phase'] }).phase;
+  const phase = rawPhase && typeof rawPhase === 'object'
+    ? {
+        level: Number.isFinite(Number(rawPhase.level)) ? Math.max(1, Math.round(Number(rawPhase.level))) : undefined,
+        total_levels: Number.isFinite(Number(rawPhase.total_levels)) ? Math.max(1, Math.round(Number(rawPhase.total_levels))) : undefined,
+        current_cap: Number.isFinite(Number(rawPhase.current_cap)) ? Math.max(1, Math.round(Number(rawPhase.current_cap))) : undefined,
+        next_cap: Number.isFinite(Number(rawPhase.next_cap)) ? Math.max(1, Math.round(Number(rawPhase.next_cap))) : (rawPhase.next_cap === null ? null : undefined),
+        streak_days: Number.isFinite(Number(rawPhase.streak_days)) ? Math.max(0, Math.round(Number(rawPhase.streak_days))) : undefined,
+        days_required: Number.isFinite(Number(rawPhase.days_required)) ? Math.max(1, Math.round(Number(rawPhase.days_required))) : undefined,
+        remaining_days: Number.isFinite(Number(rawPhase.remaining_days)) ? Math.max(0, Math.round(Number(rawPhase.remaining_days))) : undefined,
+        last_valid_date: typeof rawPhase.last_valid_date === 'string' ? rawPhase.last_valid_date : null,
+        caps: Array.isArray(rawPhase.caps) ? rawPhase.caps.map((n) => Math.max(1, Math.round(Number(n || 0)))).filter((n) => Number.isFinite(n) && n > 0) : undefined,
+      }
+    : undefined;
+  return {
+    used,
+    cap,
+    remaining,
+    percent,
+    profile: typeof value.profile === 'string' ? value.profile : undefined,
+    pause_window_seconds: pauseWindow,
+    window_seconds: windowSeconds,
+    phase,
+  };
+};
+
+const getJobCapacity24h = (job: MessageJob): Capacity24h | undefined => {
+  const canonical = normalizeCapacity24h(job.capacity_24h);
+  if (canonical) return canonical;
+  const fromLimit = normalizeCapacity24h(job.limit);
+  if (fromLimit) return fromLimit;
+  const legacyUsed = typeof job.limit_used === 'number' ? job.limit_used : undefined;
+  const legacyCap = typeof job.limit_cap === 'number' ? job.limit_cap : undefined;
+  if (typeof legacyUsed === 'number' && typeof legacyCap === 'number' && legacyCap > 0) {
+    return normalizeCapacity24h({
+      used: legacyUsed,
+      cap: legacyCap,
+      percent: job.limit_percent,
+      pause_window_seconds: job.limit_pause_window_seconds,
+      profile: job.limit_profile,
+    });
+  }
+  return undefined;
+};
+
+const getJobLimitUsage = (job: MessageJob) => {
+  const capacity = getJobCapacity24h(job);
+  const used = capacity?.used;
+  const cap = capacity?.cap;
+  return { used, cap };
 };
 
 const CRM_STATUS_OPTIONS = [
@@ -407,6 +546,37 @@ type IgAccount = {
   last_error?: string;
   daily_dm_limit?: number;
   daily_dm_sent?: number;
+  capacity_24h?: {
+    used?: number;
+    cap?: number;
+    remaining?: number;
+    percent?: number;
+    profile?: string;
+    pause_window_seconds?: number;
+    window_seconds?: number;
+    phase?: Capacity24h['phase'];
+  };
+  policy?: {
+    profile?: string;
+    max_dms_per_day?: number;
+    max_dms_cap?: number;
+    scale_increment_dms?: number;
+    scale_increment_every_days?: number;
+    dm_delay_min_seconds?: number;
+    dm_delay_max_seconds?: number;
+    dm_block_size?: number;
+    dm_block_pause_min_minutes?: number;
+    dm_block_pause_max_minutes?: number;
+    pre_dm_warmup_seconds_min?: number;
+    pre_dm_warmup_seconds_max?: number;
+    session_warmup_required?: boolean;
+    limit_pause_window_seconds?: number;
+    phase_level?: number;
+    phase_streak_days?: number;
+    phase_days_required?: number;
+    phase_next_cap?: number | null;
+    phase_remaining_days?: number;
+  };
   is_busy?: boolean;
   account_type?: 'mature' | 'new' | 'rehab';
   account_warmup_status?: string;
@@ -416,6 +586,19 @@ type IgAccount = {
   session_warmup_phase?: string;
   requires_session_warmup?: boolean;
   requires_account_warmup?: boolean;
+};
+
+const getAccountCapacity24h = (account?: IgAccount | null, fallbackUsed?: number): Capacity24h | undefined => {
+  if (!account) return undefined;
+  const canonical = normalizeCapacity24h(account.capacity_24h);
+  if (canonical) return canonical;
+  const legacyCap = typeof account.daily_dm_limit === 'number' && account.daily_dm_limit > 0 ? account.daily_dm_limit : 20;
+  const legacySent = typeof account.daily_dm_sent === 'number' ? account.daily_dm_sent : 0;
+  const safeFallback = typeof fallbackUsed === 'number' ? Math.max(0, fallbackUsed) : undefined;
+  return normalizeCapacity24h({
+    used: Math.max(legacySent, safeFallback ?? 0),
+    cap: legacyCap,
+  });
 };
 
 type ApiError = {
@@ -481,6 +664,7 @@ type EmergencyStopResponse = {
   message: string;
   campaigns_stopped: number;
   warmups_stopped: number;
+  outreach_stopped: number;
   emergency_flag_set: boolean;
 };
 
@@ -630,7 +814,7 @@ type UpdateStatus = {
 
 export default function Dashboard() {
   const [currentRoute, setCurrentRoute] = useState<'auth' | 'register' | 'accounts' | 'app'>('auth');
-  const [currentView, setCurrentView] = useState<'dashboard' | 'crm' | 'campaigns' | 'message_studio' | 'guide' | 'api_keys' | 'admin_accounts'>('dashboard');
+  const [currentView, setCurrentView] = useState<'dashboard' | 'crm' | 'campaigns' | 'message_studio' | 'account_status' | 'guide' | 'api_keys' | 'admin_accounts'>('dashboard');
   const [isWorkspaceSessionExpired, setIsWorkspaceSessionExpired] = useState(false);
 
   useEffect(() => {
@@ -696,6 +880,7 @@ export default function Dashboard() {
   const campaignDeleteConfirmTimeouts = useRef<Record<string, number>>({});
   const [showEmergencyStopModal, setShowEmergencyStopModal] = useState(false);
   const [isEmergencyStopping, setIsEmergencyStopping] = useState(false);
+  const [showJobHistory, setShowJobHistory] = useState(false);
   const [emergencyStopResult, setEmergencyStopResult] = useState<EmergencyStopResponse | null>(null);
   const openHowTo = () => {
     setCurrentRoute('app');
@@ -848,6 +1033,9 @@ export default function Dashboard() {
   };
   const messageJobsDataRaw = messageJobsData?.jobs || [];
   const messageJobs = messageJobsDataRaw.filter((job) => job.kind !== 'prepare');
+  const activeMessageJobs = messageJobs.filter((job) => job.status === 'running' || job.status === 'queued' || job.status === 'paused');
+  const historicalMessageJobs = messageJobs.filter((job) => !(job.status === 'running' || job.status === 'queued' || job.status === 'paused'));
+  const visibleMessageJobs = (showJobHistory ? messageJobs : activeMessageJobs).slice(0, 4);
   const activeCampaigns: ActiveCampaign[] = (botStatus?.campaigns || []).map((campaign) => ({
     id: campaign.id,
     campaignName: campaign.campaign_name || `@${campaign.username} · ${campaign.sources?.[0]?.value || campaign.id.slice(0, 8)}`,
@@ -1501,7 +1689,7 @@ export default function Dashboard() {
     if (crmFilter === 'qualified') return ['Respondio', 'Calificado'].includes(lead.status);
     return lead.status === 'Error';
   });
-  const sentInLast24h = useMemo(() => {
+  const fallbackSentInLast24h = useMemo(() => {
     const cutoffMs = Date.now() - (24 * 60 * 60 * 1000);
     return leadsArray.filter((lead: Lead) => {
       const lastSent = lead.sent_at || lead.contacted_at;
@@ -1513,20 +1701,76 @@ export default function Dashboard() {
       return true;
     }).length;
   }, [activeAccount, leadsArray]);
-  const activeDailyLimit = activeAccount?.daily_dm_limit || 20;
-  const activeDailySent = activeAccount ? Math.max(activeAccount.daily_dm_sent || 0, sentInLast24h) : 0;
-  const activeDailyRemaining = Math.max(0, activeDailyLimit - activeDailySent);
+  const activeAccountCapacity24h = useMemo(() => getAccountCapacity24h(activeAccount, fallbackSentInLast24h), [activeAccount, fallbackSentInLast24h]);
+  const activeDailyLimit = activeAccountCapacity24h?.cap ?? (activeAccount?.daily_dm_limit || 20);
+  const activeDailySent = activeAccountCapacity24h?.used ?? (activeAccount ? Math.max(activeAccount.daily_dm_sent || 0, fallbackSentInLast24h) : 0);
+  const activeDailyRemaining = activeAccountCapacity24h?.remaining ?? Math.max(0, activeDailyLimit - activeDailySent);
   const selectedLeadSendEta = estimateSendEtaRangeSeconds(selectedLeadIds.length, activeAccount?.id, leadsArray);
   const warmupRange = estimateWarmupRangeSeconds(activeAccount?.account_type);
   const totalRangeForSelected = {
     min: selectedLeadSendEta.min + warmupRange.min,
     max: selectedLeadSendEta.max + warmupRange.max,
   };
-  const activeOutreachJob = messageJobs.find((job) => job.kind === 'outreach' && (job.status === 'running' || job.status === 'queued'));
+  const activeOutreachJob = messageJobs.find((job) => job.kind === 'outreach' && (job.status === 'running' || job.status === 'queued' || isPausedByLimit(job)));
   const reloginSignal = `${activeAccount?.last_error || ''} ${activeAccount?.current_action || ''}`.toLowerCase();
   const accountNeedsRelogin = Boolean(
     activeAccount && /sesion no activa|sesion ausente|no hay sesion|re-loguea|login detectado|sessionid|challenge/.test(reloginSignal)
   );
+  const limitNoticeRef = useRef<Record<string, Set<number>>>({});
+  const phaseNoticeRef = useRef<Record<string, Set<string>>>({});
+
+  useEffect(() => {
+    messageJobs.forEach((job) => {
+      if (job.kind !== 'outreach') return;
+      const { used, cap } = getJobLimitUsage(job);
+      if (typeof used !== 'number' || typeof cap !== 'number' || cap <= 0) return;
+      const pct = Math.floor((used / cap) * 100);
+      const thresholds = [80, 95, 100];
+      thresholds.forEach((threshold) => {
+        if (pct < threshold) return;
+        const seen = limitNoticeRef.current[job.id] || new Set<number>();
+        if (seen.has(threshold)) return;
+        seen.add(threshold);
+        limitNoticeRef.current[job.id] = seen;
+        if (threshold >= 100) {
+          toast.warning(`Se alcanzó el tope diario (${used}/${cap}). El job entrará en pausa por límite.`);
+          return;
+        }
+        toast.info(`Límite de envío al ${threshold}% (${used}/${cap}).`);
+      });
+    });
+  }, [messageJobs]);
+
+  useEffect(() => {
+    messageJobs.forEach((job) => {
+      if (job.kind !== 'outreach') return;
+      const evt = job.phase_event;
+      const evtName = evt?.event;
+      if (!evtName || evtName === 'none') return;
+      const key = `${evtName}:${evt?.to_level || evt?.streak_days || 0}`;
+      const seen = phaseNoticeRef.current[job.id] || new Set<string>();
+      if (seen.has(key)) return;
+      seen.add(key);
+      phaseNoticeRef.current[job.id] = seen;
+
+      if (evtName === 'phase_up') {
+        const toLevel = evt?.to_level || 0;
+        const newCap = evt?.new_cap || 0;
+        toast.success(`🚀 Subiste a Fase ${toLevel}. Nuevo límite: ${newCap} DMs/día.`);
+        return;
+      }
+
+      if (evtName === 'streak_day_completed') {
+        const streak = evt?.streak_days || 0;
+        const required = evt?.days_required || 3;
+        const remaining = Math.max(0, required - streak);
+        const suffix = remaining > 0
+          ? ` Faltan ${remaining} día(s) para escalar.`
+          : ' ¡Listo para escalar en el próximo ciclo!';
+        toast.success(`🔥 En racha: ${streak}/${required} días válidos.${suffix}`);
+      }
+    });
+  }, [messageJobs]);
 
   const toggleLeadSelection = (leadId: number) => {
     setSelectedLeadIds((prev) => prev.includes(leadId) ? prev.filter((id) => id !== leadId) : [...prev, leadId]);
@@ -1749,7 +1993,20 @@ export default function Dashboard() {
         }),
       });
       const raw = await res.text();
-      let data: { detail?: string; job?: { total?: number; eta_seconds?: number | null; eta_min_seconds?: number | null; eta_max_seconds?: number | null } } = {};
+      let data: {
+        status?: string;
+        detail?: string;
+        job?: {
+          total?: number;
+          eta_seconds?: number | null;
+          eta_min_seconds?: number | null;
+          eta_max_seconds?: number | null;
+          resume_eta_seconds?: number | null;
+          limit_used?: number;
+          limit_cap?: number;
+          capacity_24h?: MessageJob['capacity_24h'];
+        };
+      } = {};
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
@@ -1764,9 +2021,68 @@ export default function Dashboard() {
       const estimatedRange = estimateSendEtaRangeSeconds(total);
       const etaMin = data.job?.eta_min_seconds ?? estimatedRange.min;
       const etaMax = data.job?.eta_max_seconds ?? estimatedRange.max;
+      if (data.status === 'paused') {
+        const capacity = normalizeCapacity24h(data.job?.capacity_24h) || normalizeCapacity24h({ used: data.job?.limit_used, cap: data.job?.limit_cap });
+        const used = capacity?.used;
+        const cap = capacity?.cap;
+        const eta = data.job?.resume_eta_seconds;
+        toast.warning(`Tope activo${typeof used === 'number' && typeof cap === 'number' ? ` (${used}/${cap})` : ''}. Reanuda en ${formatDuration(eta || 0)}.`);
+        return;
+      }
       toast.success(`Envío iniciado para ${total} lead(s). ${formatDurationRange(etaMin, etaMax)}.`);
     } catch {
       toast.error('Error lanzando la cola de outreach.');
+    }
+  };
+
+  const stopMessageJob = async (jobId: string) => {
+    try {
+      const res = await apiFetch(apiUrl(`/api/messages/jobs/${jobId}/stop?workspace_id=${currentUserId}`), {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data.detail || 'No pude detener el job.');
+        return;
+      }
+      await mutateMessageJobs();
+      toast.success('Job detenido.');
+    } catch {
+      toast.error('Error deteniendo el job.');
+    }
+  };
+
+  const pauseMessageJob = async (jobId: string) => {
+    try {
+      const res = await apiFetch(apiUrl(`/api/messages/jobs/${jobId}/pause?workspace_id=${currentUserId}`), {
+        method: 'POST',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data.detail || 'No pude pausar el job.');
+        return;
+      }
+      await mutateMessageJobs();
+      toast.success('Job pausado.');
+    } catch {
+      toast.error('Error pausando el job.');
+    }
+  };
+
+  const deleteMessageJob = async (jobId: string) => {
+    try {
+      const res = await apiFetch(apiUrl(`/api/messages/jobs/${jobId}?workspace_id=${currentUserId}`), {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        toast.error(data.detail || 'No pude eliminar el job.');
+        return;
+      }
+      await mutateMessageJobs();
+      toast.success('Job eliminado de la cola.');
+    } catch {
+      toast.error('Error eliminando el job.');
     }
   };
 
@@ -1998,13 +2314,9 @@ export default function Dashboard() {
                           <Badge variant="outline" className="border-slate-700 text-slate-300">
                             {acc.account_type === 'new' ? 'Cuenta nueva' : acc.account_type === 'rehab' ? 'Rehabilitación' : 'Cuenta madura'}
                           </Badge>
-                          {detectSessionExpired(acc) ? (
-                            <Badge variant="outline" className="border-rose-500/30 text-rose-300">⚠️ Sesión Expirada - Re-loguear</Badge>
-                          ) : (
-                            <Badge variant="outline" className={`${acc.warmup_status === 'running' ? 'border-amber-500/30 text-amber-300' : acc.requires_session_warmup ? 'border-rose-500/30 text-rose-300' : 'border-emerald-500/30 text-emerald-300'}`}>
-                              {acc.warmup_status === 'running' ? 'Sesión activa' : acc.requires_session_warmup ? 'Sesión fría' : 'Sesión lista'}
-                            </Badge>
-                          )}
+                          <Badge variant="outline" className={`${detectSessionExpired(acc) ? 'border-rose-500/30 text-rose-300' : acc.warmup_status === 'running' ? 'border-amber-500/30 text-amber-300' : acc.requires_session_warmup ? 'border-rose-500/30 text-rose-300' : 'border-emerald-500/30 text-emerald-300'}`}>
+                            {detectSessionExpired(acc) ? 'Re-loguear requerido' : acc.warmup_status === 'running' ? 'Sesión activa' : acc.requires_session_warmup ? 'Sesión fría' : 'Sesión lista'}
+                          </Badge>
                           {acc.requires_account_warmup && <Badge variant="outline" className="border-rose-500/30 text-rose-300">Calentamiento de cuenta pendiente</Badge>}
                         </div>
                         <p className="mt-3 text-sm text-slate-400">{cleanOperatorMessage(acc.current_action) || 'Aquí gestionas tu cuenta emisora: salud, límites y calentamiento de cuenta. El calentamiento previo al envío se lanza desde CRM.'}</p>
@@ -2021,7 +2333,7 @@ export default function Dashboard() {
                           </div>
                         </div>
                         <div className="mt-4 flex flex-wrap gap-2 text-xs">
-                          <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">DMs hoy: {acc.daily_dm_sent || 0}/{acc.daily_dm_limit || 20}</span>
+                          <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">DMs hoy: {getAccountCapacity24h(acc)?.used ?? (acc.daily_dm_sent || 0)}/{getAccountCapacity24h(acc)?.cap ?? (acc.daily_dm_limit || 20)}</span>
                           <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">Última sesión lista: {acc.session_warmup_last_run_at ? new Date(acc.session_warmup_last_run_at).toLocaleString() : 'Nunca'}</span>
                           <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">Duracion: {acc.warmup_last_duration_min || 0} min</span>
                           <span className="rounded-full bg-slate-800 px-3 py-1 text-slate-300">Plan cuenta: {acc.account_warmup_days_completed || 0}/{acc.account_warmup_days_total || 0} días</span>
@@ -2286,6 +2598,12 @@ export default function Dashboard() {
               <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3 px-2">Seguridad</p>
               <nav className="space-y-1">
                 <button
+                  onClick={() => { setCurrentView('account_status'); }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl font-medium transition-colors cursor-pointer text-left ${currentView === 'account_status' ? 'bg-purple-500/10 text-purple-400' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'}`}
+                >
+                  <CheckCircle className="w-4 h-4" /> Estado de cuenta
+                </button>
+                <button
                   onClick={openHowTo}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl font-medium transition-colors cursor-pointer text-left ${currentView === 'guide' ? 'bg-purple-500/10 text-purple-400' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'}`}
                 >
@@ -2388,7 +2706,7 @@ export default function Dashboard() {
                     <p className="text-xs uppercase tracking-[0.2em] text-rose-300">Parada de Emergencia</p>
                     <h3 className="mt-2 text-xl font-semibold text-slate-100">¿Detener todas las operaciones?</h3>
                     <p className="mt-2 text-sm text-slate-300">
-                      Esta acción cancelará inmediatamente todas las campanas activas y calentamientos de cuenta. 
+                      Esta acción cancelará inmediatamente todas las campanas activas, calentamientos de cuenta y envíos de DM en progreso. 
                       No se puede deshacer.
                     </p>
                     
@@ -2405,7 +2723,7 @@ export default function Dashboard() {
                           <CheckCircle className="h-4 w-4" />
                           <span>{emergencyStopResult.message}</span>
                         </div>
-                        <div className="grid grid-cols-2 gap-3">
+                        <div className="grid grid-cols-3 gap-3">
                           <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-center">
                             <p className="text-xs text-slate-400">Campanas</p>
                             <p className="text-lg font-semibold text-slate-200">{emergencyStopResult.campaigns_stopped}</p>
@@ -2413,6 +2731,10 @@ export default function Dashboard() {
                           <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-center">
                             <p className="text-xs text-slate-400">Calentamientos</p>
                             <p className="text-lg font-semibold text-slate-200">{emergencyStopResult.warmups_stopped}</p>
+                          </div>
+                          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3 text-center">
+                            <p className="text-xs text-slate-400">Envíos</p>
+                            <p className="text-lg font-semibold text-slate-200">{emergencyStopResult.outreach_stopped}</p>
                           </div>
                         </div>
                       </div>
@@ -2915,7 +3237,9 @@ export default function Dashboard() {
                       <p className="mt-1 text-sm font-semibold text-slate-100">Próximo paso operativo</p>
                       <p className="mt-1 text-sm text-slate-300">
                         {activeOutreachJob
-                          ? `Envío en curso: ${activeOutreachJob.processed}/${activeOutreachJob.total} leads${activeOutreachJob.current_lead ? ` · @${activeOutreachJob.current_lead}` : ''}.`
+                          ? (isPausedByLimit(activeOutreachJob)
+                              ? `Envío pausado por límite: ${activeOutreachJob.processed}/${activeOutreachJob.total} leads procesados. Se reanudará automáticamente al vencer la pausa.`
+                              : `Envío en curso: ${activeOutreachJob.processed}/${activeOutreachJob.total} leads${activeOutreachJob.current_lead ? ` · @${activeOutreachJob.current_lead}` : ''}.`)
                           : activeAccount?.warmup_status === 'running'
                             ? `Calentamiento en curso para ${selectedLeadIds.length > 0 ? `${selectedLeadIds.length} lead(s) seleccionados` : 'la cuenta'}: ${activeAccount.current_action || 'trabajando...'}`
                             : activeAccount?.requires_session_warmup
@@ -2927,7 +3251,9 @@ export default function Dashboard() {
                     </div>
                     <span className="text-sm text-slate-400">
                       {activeOutreachJob
-                        ? `${formatDurationRange(activeOutreachJob.eta_min_seconds, activeOutreachJob.eta_max_seconds)} · ${activeOutreachJob.processed}/${activeOutreachJob.total}`
+                        ? (isPausedByLimit(activeOutreachJob)
+                            ? `Reanuda en: ${formatDuration(activeOutreachJob.resume_eta_seconds || 0)} · ${activeOutreachJob.processed}/${activeOutreachJob.total}`
+                            : `${formatDurationRange(activeOutreachJob.eta_min_seconds, activeOutreachJob.eta_max_seconds)} · ${activeOutreachJob.processed}/${activeOutreachJob.total}`)
                         : activeAccount?.warmup_status === 'running'
                           ? `Progreso warmup: ${activeAccount.warmup_progress || 0}%`
                           : selectedLeadIds.length > 0
@@ -2938,17 +3264,27 @@ export default function Dashboard() {
                 </div>
               </div>
 
-              {messageJobs.length > 0 && (
+              {(activeMessageJobs.length > 0 || historicalMessageJobs.length > 0) && (
                 <div className="mb-6 rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-xl">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-xs uppercase tracking-wider text-slate-500">Cola visible</p>
                       <h3 className="mt-1 text-lg font-semibold text-slate-100">Envíos recientes</h3>
                     </div>
-                    <Badge variant="outline" className="border-emerald-500/30 text-emerald-300">{messageJobs.length} envío(s)</Badge>
+                    <div className="flex items-center gap-2">
+                      {historicalMessageJobs.length > 0 && (
+                        <button
+                          onClick={() => setShowJobHistory((prev) => !prev)}
+                          className="rounded-lg border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:border-cyan-500 hover:text-cyan-200"
+                        >
+                          {showJobHistory ? 'Ver solo activos' : `Ver historial (${historicalMessageJobs.length})`}
+                        </button>
+                      )}
+                      <Badge variant="outline" className="border-emerald-500/30 text-emerald-300">{activeMessageJobs.length} activo(s)</Badge>
+                    </div>
                   </div>
                   <div className="mt-4 grid grid-cols-1 xl:grid-cols-2 gap-4">
-                    {messageJobs.slice(0, 4).map((job) => (
+                    {visibleMessageJobs.map((job) => (
                       <div key={job.id} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
                         <div className="flex items-center justify-between gap-3">
                           <p className="text-sm font-medium text-slate-100">Envío {job.id.slice(0, 8)}</p>
@@ -2959,7 +3295,12 @@ export default function Dashboard() {
                             <Badge
                               variant="outline"
                               className={
-                                job.status === 'completed' ? 'border-emerald-500/30 text-emerald-300' : job.status === 'error' ? 'border-rose-500/30 text-rose-300' : 'border-cyan-500/30 text-cyan-300'}>{formatJobStatusLabel(job.status)}</Badge>
+                                job.status === 'completed' ? 'border-emerald-500/30 text-emerald-300' : job.status === 'error' ? 'border-rose-500/30 text-rose-300' : job.status === 'stopped' ? 'border-slate-500/30 text-slate-300' : job.status === 'paused' ? 'border-amber-500/30 text-amber-300' : 'border-cyan-500/30 text-cyan-300'}>{formatJobStatusLabel(job.status)}</Badge>
+                            {isPausedByLimit(job) && (
+                              <Badge variant="outline" className="border-rose-500/30 text-rose-300">
+                                Pausado por límite
+                              </Badge>
+                            )}
                           </div>
                         </div>
                         <p className="mt-2 text-xs text-slate-400">{cleanOperatorMessage(job.current_action)}</p>
@@ -2969,14 +3310,50 @@ export default function Dashboard() {
                         <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
                           <span>{job.processed}/{job.total} procesados</span>
                           {job.current_lead && <span>lead actual: @{job.current_lead}</span>}
-                          <span>{formatDurationRange(job.eta_min_seconds, job.eta_max_seconds)}</span>
+                          <span>{isPausedByLimit(job) ? `Reanuda en: ${formatDuration(job.resume_eta_seconds || 0)}` : formatDurationRange(job.eta_min_seconds, job.eta_max_seconds)}</span>
                           <span>campaña: {job.campaign_id ? (campaignLabelById[job.campaign_id] || job.campaign_id.slice(0, 8)) : 'global'}</span>
+                          {(() => {
+                            const { used, cap } = getJobLimitUsage(job);
+                            if (typeof used !== 'number' || typeof cap !== 'number') return null;
+                            return <span>límite: {used}/{cap}</span>;
+                          })()}
                           {typeof job.metrics?.sent === 'number' && <span>enviados: {job.metrics.sent}</span>}
                           {typeof job.metrics?.errors === 'number' && <span>errores: {job.metrics.errors}</span>}
                           {typeof job.metrics?.no_dm_button === 'number' && job.metrics.no_dm_button > 0 && <span>sin botón DM: {job.metrics.no_dm_button}</span>}
                         </div>
+                        {(job.status === 'running' || job.status === 'queued') && (
+                          <div className="mt-3 flex gap-2">
+                            <button
+                              onClick={() => pauseMessageJob(job.id)}
+                              className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-amber-500"
+                            >
+                              ⏸️ Pausar
+                            </button>
+                            <button
+                              onClick={() => stopMessageJob(job.id)}
+                              className="rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-rose-500"
+                            >
+                              ⏹️ Detener
+                            </button>
+                          </div>
+                        )}
+                        {(job.status === 'error' || job.status === 'stopped') && (
+                          <div className="mt-3 flex gap-2">
+                            <button
+                              onClick={() => deleteMessageJob(job.id)}
+                              className="rounded-lg bg-slate-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-600"
+                            >
+                              🗑️ Eliminar de la cola
+                            </button>
+                          </div>
+                        )}
                       </div>
                     ))}
+                    {visibleMessageJobs.length === 0 && (
+                      <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-400">
+                        No hay envíos activos ahora. Puedes abrir historial para revisar ejecuciones previas.
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
@@ -3421,6 +3798,155 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {currentView === 'account_status' && (
+            <div className="animate-in fade-in slide-in-from-bottom-4 space-y-6">
+              <div className="rounded-3xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300">Seguridad</p>
+                <h2 className="mt-3 text-3xl font-bold tracking-tight text-slate-100">Estado de cuenta</h2>
+                <p className="mt-2 text-sm text-slate-400">Todo lo importante de la cuenta en un solo lugar: cupo real, cuánto queda, cuándo se reanuda y cómo escala.</p>
+              </div>
+
+              {activeAccount ? (
+                <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5 shadow-xl">
+                  {(() => {
+                    const capacity = getAccountCapacity24h(activeAccount);
+                    const policy = activeAccount.policy;
+                    const accountType = (activeAccount.account_type || 'mature').toLowerCase();
+                    const accountTypeLabel = accountType === 'new' ? 'Nueva' : accountType === 'rehab' ? 'Rehabilitación' : 'Personal/Madura';
+                    const progressDays = Number(activeAccount.account_warmup_days_completed || 0);
+                    const totalDays = Number(activeAccount.account_warmup_days_total || 0);
+                    const scaleEvery = Number(policy?.scale_increment_every_days || 0);
+                    const scaleInc = Number(policy?.scale_increment_dms || 0);
+                    const nextScaleInDays = scaleEvery > 0 ? Math.max(0, scaleEvery - (progressDays % scaleEvery || 0)) : null;
+                    const limitPauseWindow = Number(capacity?.pause_window_seconds || policy?.limit_pause_window_seconds || 0);
+                    const phaseInfo = capacity?.phase;
+                    const phaseCaps = (phaseInfo?.caps && phaseInfo.caps.length > 0)
+                      ? phaseInfo.caps
+                      : (String(policy?.profile || '').toLowerCase() === 'new'
+                        ? [10, 15, 20, 30]
+                        : String(policy?.profile || '').toLowerCase() === 'rehab'
+                          ? [8, 11, 14, 20]
+                          : [40, 43, 46, 50]);
+                    const activePhaseIdx = Math.max(0, Math.min(phaseCaps.length - 1, Number(phaseInfo?.level || 1) - 1));
+                    const activeReason = isPausedByLimit(activeOutreachJob || ({ status: '' } as MessageJob))
+                      ? 'Pausado por límite'
+                      : activeOutreachJob?.status === 'running'
+                        ? 'En ejecución'
+                        : activeOutreachJob?.status === 'paused'
+                          ? 'Pausado manual'
+                          : 'Listo';
+                    return (
+                      <>
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div>
+                      <p className="text-xs uppercase tracking-wider text-slate-500">Cuenta activa</p>
+                      <h3 className="mt-1 text-xl font-semibold text-slate-100">@{activeAccount.ig_username}</h3>
+                      <p className="mt-2 text-sm text-slate-400">Panel operativo para entender exactamente cuánto podés enviar hoy y qué pasará después.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant="outline" className="border-cyan-500/30 text-cyan-300">Ventana: últimas 24h</Badge>
+                      <Badge variant="outline" className="border-purple-500/30 text-purple-300">Tipo: {accountTypeLabel}</Badge>
+                      <Badge variant="outline" className="border-amber-500/30 text-amber-300">Estado: {activeReason}</Badge>
+                    </div>
+                  </div>
+                  <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Enviados en 24h <InfoHint text="Cantidad de DMs enviados por esta cuenta en las últimas 24 horas (ventana móvil)." /></p>
+                      <p className="mt-2 text-2xl font-semibold text-slate-100">{capacity?.used ?? activeDailySent}</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Límite actual <InfoHint text="Máximo permitido para esta cuenta en la ventana de 24 horas." /></p>
+                      <p className="mt-2 text-2xl font-semibold text-slate-100">{capacity?.cap ?? activeDailyLimit}</p>
+                    </div>
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Te quedan hoy <InfoHint text="DMs restantes antes de que la cuenta se pause automáticamente por seguridad." /></p>
+                      <p className="mt-2 text-2xl font-semibold text-emerald-300">{capacity?.remaining ?? activeDailyRemaining}</p>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-xl border border-cyan-500/20 bg-cyan-500/5 p-4">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-slate-300">Progreso del cupo diario</span>
+                      <span className="font-semibold text-cyan-200">{capacity?.used ?? activeDailySent}/{capacity?.cap ?? activeDailyLimit}</span>
+                    </div>
+                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-800">
+                      <div className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-emerald-400" style={{ width: `${Math.min(100, capacity?.percent ?? 0)}%` }}></div>
+                    </div>
+                    <p className="mt-2 text-xs text-slate-400">
+                      {capacity?.remaining ?? 0} DM(s) disponibles antes de pausar. {isPausedByLimit(activeOutreachJob || ({ status: '' } as MessageJob)) ? `Reanuda en ${formatDuration(activeOutreachJob?.resume_eta_seconds || 0)}.` : ''}
+                    </p>
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-1 gap-3 lg:grid-cols-2">
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Reglas de seguridad activas <InfoHint text="Reglas que Botardium usa para pausar y proteger la cuenta automáticamente." /></p>
+                      <div className="mt-2 space-y-1 text-sm text-slate-300">
+                        <p>Perfil operativo: <span className="font-semibold text-slate-100">{String(policy?.profile || capacity?.profile || accountTypeLabel)}</span></p>
+                        <p>Cuando llega al límite, pausa: <span className="font-semibold text-slate-100">{limitPauseWindow > 0 ? formatDuration(limitPauseWindow) : '--'}</span></p>
+                        <p>Uso actual del cupo: <span className="font-semibold text-slate-100">{capacity?.percent ?? 0}%</span></p>
+                        {isPausedByLimit(activeOutreachJob || ({ status: '' } as MessageJob)) && (
+                          <p>Reanudación estimada: <span className="font-semibold text-amber-300">{formatDuration(activeOutreachJob?.resume_eta_seconds || 0)}</span></p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                      <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Tiempos automáticos <InfoHint text="Tiempos aleatorios para simular comportamiento humano y evitar patrones repetitivos." /></p>
+                      <div className="mt-2 space-y-1 text-sm text-slate-300">
+                        <p>Warmup antes de cada DM: <span className="font-semibold text-slate-100">{formatOperationalRange(policy?.pre_dm_warmup_seconds_min, policy?.pre_dm_warmup_seconds_max)}</span></p>
+                        <p>Espera entre DMs: <span className="font-semibold text-slate-100">{formatOperationalRange(policy?.dm_delay_min_seconds, policy?.dm_delay_max_seconds)}</span></p>
+                        <p>Bloque de envío: <span className="font-semibold text-slate-100">{policy?.dm_block_size ?? '--'} leads</span></p>
+                        <p>Pausa entre bloques: <span className="font-semibold text-slate-100">{(policy?.dm_block_pause_min_minutes && policy?.dm_block_pause_max_minutes) ? `${policy.dm_block_pause_min_minutes}-${policy.dm_block_pause_max_minutes} min` : '--'}</span></p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 rounded-xl border border-slate-800 bg-slate-950/60 p-4">
+                    <p className="text-xs uppercase tracking-wider text-slate-500 inline-flex items-center gap-2">Progresión del límite <InfoHint text="Muestra cómo evoluciona el límite de envíos según el tipo de cuenta y los días estables." /></p>
+                    <div className="mt-2 grid grid-cols-1 gap-2 text-sm text-slate-300 md:grid-cols-2">
+                      <p>Días de warmup de cuenta: <span className="font-semibold text-slate-100">{progressDays}/{totalDays || '--'}</span></p>
+                      <p>Sesión requiere warmup: <span className="font-semibold text-slate-100">{activeAccount.requires_session_warmup ? 'Sí' : 'No'}</span></p>
+                      <p>Sesión warmup obligatorio: <span className="font-semibold text-slate-100">{policy?.session_warmup_required ? 'Sí' : 'No'}</span></p>
+                      <p>Escalado automático: <span className="font-semibold text-slate-100">{scaleInc > 0 ? `+${scaleInc} cada ${scaleEvery} día(s)` : 'No aplica'}</span></p>
+                    </div>
+                    <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-4">
+                      {phaseCaps.map((capValue, idx) => {
+                        const isActive = idx === activePhaseIdx;
+                        return (
+                          <div key={`phase-${capValue}`} className={`rounded-lg border p-3 ${isActive ? 'border-cyan-400/50 bg-cyan-500/10' : 'border-slate-800 bg-slate-900/60'}`}>
+                            <p className={`text-xs uppercase tracking-wider ${isActive ? 'text-cyan-300' : 'text-slate-500'}`}>Fase {idx + 1}</p>
+                            <p className={`mt-1 text-lg font-semibold ${isActive ? 'text-cyan-100' : 'text-slate-100'}`}>{capValue} DMs</p>
+                            <p className={`text-[11px] ${isActive ? 'text-cyan-300' : 'text-slate-500'}`}>{isActive ? 'Fase actual' : 'Objetivo'}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-2 rounded-lg border border-slate-800 bg-slate-900/60 p-3 text-xs text-slate-300">
+                      <p>Racha actual para subir fase: <span className="font-semibold text-cyan-200">{phaseInfo?.streak_days ?? policy?.phase_streak_days ?? 0}/{phaseInfo?.days_required ?? policy?.phase_days_required ?? 3} días consecutivos</span>.</p>
+                      <p className="mt-1">Hoy cuenta para la racha cuando llegues a <span className="font-semibold text-slate-100">{phaseInfo?.current_cap ?? (capacity?.cap ?? activeDailyLimit)} DMs</span> en el día calendario local.</p>
+                      <p className="mt-1">Faltan <span className="font-semibold text-slate-100">{phaseInfo?.remaining_days ?? policy?.phase_remaining_days ?? 0}</span> día(s) válidos para subir de fase.</p>
+                      {scaleInc > 0 && nextScaleInDays !== null && (
+                        <p className="mt-1 text-cyan-300">Próximo escalado estimado en {nextScaleInDays} día(s), hasta tope {policy?.max_dms_cap ?? phaseCaps[phaseCaps.length - 1]} DMs.</p>
+                      )}
+                    </div>
+                    {activeAccount.last_error && (
+                      <p className="mt-2 text-xs text-rose-300">Último error: {activeAccount.last_error}</p>
+                    )}
+                  </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4 text-sm text-amber-200">
+                  No hay cuenta activa seleccionada. Conecta una cuenta o elige una desde Cuentas Vinculadas.
+                </div>
+              )}
+
+
             </div>
           )}
 
