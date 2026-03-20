@@ -1,0 +1,78 @@
+name: Release Tauri Desktop
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    env:
+      BOTARDIUM_UPDATER_ENDPOINT: ${{ vars.BOTARDIUM_UPDATER_ENDPOINT }}
+      BOTARDIUM_UPDATER_PUBKEY: ${{ secrets.BOTARDIUM_UPDATER_PUBKEY }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: botardium-panel/web/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        run: choco install nsis -y
+
+      - name: Install frontend dependencies
+        working-directory: botardium-panel/web
+        run: npm ci
+
+      - name: Install backend build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install fastapi uvicorn pydantic openai patchright requests bcrypt python-dotenv pyjwt python-multipart phonenumbers email-validator ppadb
+
+      - name: Build Tauri app and updater artifacts
+        working-directory: botardium-panel/web
+        run: npm run tauri:build
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "${GITHUB_REPOSITORY}" --title "$tag" --notes "Automated desktop release for $tag"
+          fi
+
+      - name: Upload installer and updater artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release upload "$tag" \
+            "botardium-panel/web/src-tauri/target/release/bundle/nsis"/*.exe \
+            "botardium-panel/web/src-tauri/target/release/bundle/nsis"/*.sig \
+            "botardium-panel/web/src-tauri/target/release/bundle/nsis"/latest.json \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
