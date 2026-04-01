@@ -1,0 +1,68 @@
+{
+    "name": "botardium-dev",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "workspaceFolder": "/workspaces/bot_ig",
+    "remoteUser": "vscode",
+    "features": {
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "20"
+        },
+        "ghcr.io/devcontainers/features/python:1": {
+            "version": "3.13"
+        },
+        "ghcr.io/devcontainers/features/rust:1": {
+            "version": "1.77.2"
+        },
+        "ghcr.io/devcontainers/features/github-cli:1": {}
+    },
+    "mounts": [
+        "source=botardium-node-modules,target=/workspaces/bot_ig/botardium-panel/web/node_modules,type=volume",
+        "source=botardium-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+        "source=botardium-cargo-git,target=/usr/local/cargo/git,type=volume",
+        "source=botardium-rust-target,target=/workspaces/bot_ig/botardium-panel/web/src-tauri/target,type=volume",
+        "source=botardium-pip-cache,target=/home/vscode/.cache/pip,type=volume"
+    ],
+    "containerEnv": {
+        "PYTHONUNBUFFERED": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "TAURI_SKIP_SIDECAR_SIGNATURE_CHECK": "true"
+    },
+    "forwardPorts": [
+        3000,
+        8000,
+        1420
+    ],
+    "portsAttributes": {
+        "3000": {
+            "label": "frontend"
+        },
+        "8000": {
+            "label": "backend"
+        },
+        "1420": {
+            "label": "tauri-dev"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-vscode.vscode-typescript-next",
+                "bradlc.vscode-tailwindcss",
+                "rust-lang.rust-analyzer",
+                "tauri-apps.tauri-vscode",
+                "esbenp.prettier-vscode"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/python/current/bin/python",
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    },
+    "postCreateCommand": "bash .devcontainer/post-create.sh",
+    "postStartCommand": "git config --global --add safe.directory /workspaces/bot_ig || true"
+}
