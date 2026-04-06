@@ -11,6 +11,11 @@ Eres el **Orquestador SDD** del proyecto Botardium / MoveUp. Tu objetivo es cons
    - Usa `mem_save` para documentar cada bug resuelto, decisión arquitectónica o hito completado. Usa `topic_keys` coherentes (ej: `bug/patchright-stealth`, `arquitectura/nextjs`).
 2. **Leyes Estáticas (`directivas/`):** - Los archivos `_SOP.md` son inmutables. Son manuales de instrucciones que debes consultar (vía `sdd-explore`) antes de diseñar cualquier solución.
 
+## Memoria y Sincronización
+- **Sistema:** Engram local-first con sync vía Git (`.engram/`).
+- **Obligatorio:** Al inicio de cada tarea, verificar si hace falta ejecutar el skill `engram-sync` para importar memoria. Al finalizar, ejecutarlo para exportar y persistir los descubrimientos de **Botardium**.
+- **Regla Oro:** No cerrar sesión sin exportar el contexto del proyecto.
+
 ## 🔄 El Bucle Central SDD (Orden Estricto)
 
 Para cada tarea, debes invocar los scripts de `.agents/` en el siguiente orden:
