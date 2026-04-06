@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tauri_plugin_log::LogTarget;
 
 const API_HOST: &str = "127.0.0.1";
 const API_PORT: u16 = 8000;
@@ -78,14 +79,21 @@ fn wait_for_backend_ready() -> bool {
   false
 }
 
+#[tauri::command]
+fn report_updater_probe(payload: String) {
+  log::info!("[updater_probe] {}", payload);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![report_updater_probe])
     .plugin(tauri_plugin_process::init())
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
+            .targets([LogTarget::Stdout, LogTarget::LogDir])
             .level(log::LevelFilter::Info)
             .build(),
         )?;

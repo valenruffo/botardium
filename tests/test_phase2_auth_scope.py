@@ -122,6 +122,96 @@ class Phase2AuthScopeTests(unittest.TestCase):
             self.assertEqual(audit_row[2], "denied")
             self.assertIn("cross-workspace", audit_row[3])
 
+    def test_workspace_delete_requires_authentication(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            db_path = root / "database" / "botardium.db"
+            runtime_secrets_path = root / "config" / "runtime_secrets.json"
+
+            with self._runtime_patches(root, db_path, runtime_secrets_path):
+                main.init_db()
+                workspace_a = self._insert_workspace(db_path, "Workspace A", "workspace-a")
+                self._insert_workspace(db_path, "Workspace B", "workspace-b")
+
+                with TestClient(main.app) as client:
+                    response = client.delete(f"/api/workspaces/{workspace_a}")
+
+            self.assertEqual(response.status_code, 401)
+
+    def test_workspace_delete_cross_workspace_is_denied_and_audited(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            db_path = root / "database" / "botardium.db"
+            runtime_secrets_path = root / "config" / "runtime_secrets.json"
+
+            with self._runtime_patches(root, db_path, runtime_secrets_path):
+                main.init_db()
+                workspace_a = self._insert_workspace(db_path, "Workspace A", "workspace-a")
+                workspace_b = self._insert_workspace(db_path, "Workspace B", "workspace-b")
+                token_a = self._login_token(workspace_a)
+
+                with TestClient(main.app) as client:
+                    response = client.delete(
+                        f"/api/workspaces/{workspace_b}",
+                        headers=self._auth_headers(token_a),
+                    )
+
+                self.assertEqual(response.status_code, 403)
+
+                conn = sqlite3.connect(db_path)
+                workspace_b_row = conn.execute("SELECT id FROM users WHERE id = ?", (workspace_b,)).fetchone()
+                audit_row = conn.execute(
+                    "SELECT workspace_id, action, outcome, detail FROM audit_events WHERE action = ? ORDER BY id DESC LIMIT 1",
+                    ("workspace.delete",),
+                ).fetchone()
+                conn.close()
+
+            self.assertIsNotNone(workspace_b_row)
+            self.assertIsNotNone(audit_row)
+            self.assertEqual(audit_row[0], workspace_a)
+            self.assertEqual(audit_row[1], "workspace.delete")
+            self.assertEqual(audit_row[2], "denied")
+            self.assertIn("cross-workspace", audit_row[3])
+
+    def test_workspace_delete_same_workspace_succeeds_and_audits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            db_path = root / "database" / "botardium.db"
+            runtime_secrets_path = root / "config" / "runtime_secrets.json"
+
+            with self._runtime_patches(root, db_path, runtime_secrets_path):
+                main.init_db()
+                workspace_a = self._insert_workspace(db_path, "Workspace A", "workspace-a")
+                self._insert_workspace(db_path, "Workspace B", "workspace-b")
+                lead_a = self._insert_lead(db_path, workspace_a, "lead_a")
+                token_a = self._login_token(workspace_a)
+
+                with TestClient(main.app) as client:
+                    response = client.delete(
+                        f"/api/workspaces/{workspace_a}",
+                        headers=self._auth_headers(token_a),
+                    )
+
+                self.assertEqual(response.status_code, 200)
+
+                conn = sqlite3.connect(db_path)
+                workspace_row = conn.execute("SELECT id FROM users WHERE id = ?", (workspace_a,)).fetchone()
+                lead_row = conn.execute("SELECT id FROM leads WHERE id = ?", (lead_a,)).fetchone()
+                audit_row = conn.execute(
+                    "SELECT workspace_id, actor_id, action, outcome, resource_id FROM audit_events WHERE action = ? ORDER BY id DESC LIMIT 1",
+                    ("workspace.delete",),
+                ).fetchone()
+                conn.close()
+
+            self.assertIsNone(workspace_row)
+            self.assertIsNone(lead_row)
+            self.assertIsNotNone(audit_row)
+            self.assertEqual(audit_row[0], workspace_a)
+            self.assertEqual(audit_row[1], f"local-workspace:{workspace_a}")
+            self.assertEqual(audit_row[2], "workspace.delete")
+            self.assertEqual(audit_row[3], "allowed")
+            self.assertEqual(audit_row[4], str(workspace_a))
+
     def _login_token(self, workspace_id: int) -> str:
         with TestClient(main.app) as client:
             response = client.post("/api/auth/login", json={"workspace_id": workspace_id})

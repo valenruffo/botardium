@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+openai
+patchright
+requests
+bcrypt
+python-dotenv
+pyjwt
+python-multipart
+phonenumbers
+email-validator
+ppadb
+google-genai
+packaging

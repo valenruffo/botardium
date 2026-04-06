@@ -2967,38 +2967,47 @@ async def create_workspace(req: WorkspaceCreateReq):
 
 
 @app.delete("/api/workspaces/{workspace_id}")
-async def delete_workspace(workspace_id: int):
+async def delete_workspace(workspace_id: int, request: Request):
     """Elimina un workspace y todos sus datos (cuentas, leads, etc)."""
+    actor = _authorize_workspace_scope(
+        request,
+        workspace_id,
+        action="workspace.delete",
+        resource_type="workspace",
+        resource_id=str(workspace_id),
+    )
+    workspace = _workspace_record(workspace_id)
     conn = _connect_db()
     cursor = conn.cursor()
-    
-    # Verificar que existe
-    cursor.execute("SELECT workspace_name FROM users WHERE id = ?", (workspace_id,))
-    row = cursor.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Workspace no encontrado.")
-    
-    workspace_name = row[0]
-    
+
     # Verificar que no sea el último workspace
     cursor.execute("SELECT COUNT(*) FROM users WHERE is_workspace = 1")
     count = cursor.fetchone()[0]
     if count <= 1:
+        _audit_event(
+            "workspace.delete",
+            actor,
+            actor.workspace_id,
+            "denied",
+            "workspace",
+            resource_id=str(workspace_id),
+            detail="cannot delete last workspace",
+        )
         conn.close()
         raise HTTPException(status_code=400, detail="No puedes eliminar el último workspace.")
-    
+
     # Eliminar en orden inverso a las dependencias
     cursor.execute("DELETE FROM leads WHERE workspace_id = ?", (workspace_id,))
     cursor.execute("DELETE FROM campaigns_cache WHERE workspace_id = ?", (workspace_id,))
     cursor.execute("DELETE FROM message_jobs_cache WHERE workspace_id = ?", (workspace_id,))
     cursor.execute("DELETE FROM ig_accounts WHERE user_id = ?", (workspace_id,))
     cursor.execute("DELETE FROM users WHERE id = ?", (workspace_id,))
-    
+
     conn.commit()
     conn.close()
-    
-    return {"ok": True, "deleted": workspace_name}
+
+    _audit_event("workspace.delete", actor, actor.workspace_id, "allowed", "workspace", resource_id=str(workspace_id))
+    return {"ok": True, "deleted": workspace["workspace_name"]}
 
 
 @app.post("/api/workspaces/{workspace_id}/export")

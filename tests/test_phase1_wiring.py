@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -89,7 +90,13 @@ class Phase1WiringTests(unittest.TestCase):
                 conn.close()
 
                 with TestClient(main.app) as client:
-                    response = client.post(f"/api/workspaces/{workspace_id}/export")
+                    login_response = client.post("/api/auth/login", json={"workspace_id": workspace_id})
+                    self.assertEqual(login_response.status_code, 200)
+                    token = login_response.json()["auth"]["token"]
+                    response = client.post(
+                        f"/api/workspaces/{workspace_id}/export",
+                        headers=self._auth_headers(token),
+                    )
 
                 self.assertEqual(response.status_code, 200)
                 payload = response.json()
@@ -154,7 +161,11 @@ class Phase1WiringTests(unittest.TestCase):
         stack.enter_context(patch.object(main, "IMPORTS_TMP_DIR", imports_dir))
         stack.enter_context(patch.object(main, "_downloads_dir", return_value=downloads_dir))
         stack.enter_context(patch.object(runtime_config, "RUNTIME_SECRETS_PATH", runtime_secrets_path))
+        stack.enter_context(patch.dict(os.environ, {"BOTARDIUM_AUTH_SECRET": "phase1-test-secret"}, clear=False))
         return stack
+
+    def _auth_headers(self, token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
 
 
 if __name__ == "__main__":

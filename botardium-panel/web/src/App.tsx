@@ -6,8 +6,10 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { check as checkNativeUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 import { MagicBox } from "@/components/magic-box";
 import { apiFetch, apiUrl, clearStoredSession, getStoredSession, setStoredSession, type StoredSession } from "@/lib/api";
+import { resolveUpdateCheckState } from "@/lib/update-check";
 import { Activity, Users, MessageSquare, ShieldAlert, Settings, LogOut, LogIn, ChevronDown, Loader2, Check, KeyRound, BookOpen, Sparkles, FolderKanban, BadgeCheck, SwitchCamera, Plus, Trash2, Info, Database, CheckCircle, AlertTriangle } from "lucide-react";
 
 declare const __APP_VERSION__: string;
@@ -897,6 +899,11 @@ export default function Dashboard() {
   const [emergencyStopResult, setEmergencyStopResult] = useState<EmergencyStopResponse | null>(null);
   const nativeUpdateRef = useRef<Awaited<ReturnType<typeof checkNativeUpdate>> | null>(null);
   const updateActionLockRef = useRef(false);
+  const updaterProbeRanRef = useRef(false);
+  const updaterProbeEnabled = import.meta.env.DEV && import.meta.env.VITE_UPDATER_PROBE === '1';
+  const updaterProbeFallbackMode = import.meta.env.DEV
+    ? String(import.meta.env.VITE_UPDATER_PROBE_FALLBACK || '').trim()
+    : '';
   const openHowTo = () => {
     setCurrentRoute('app');
     setCurrentView('guide');
@@ -1226,80 +1233,134 @@ export default function Dashboard() {
       setUpdatePhase('checking');
       setUpdatePhaseMessage('Buscando actualización nativa...');
 
-      if (isTauriDesktop()) {
-        const update = await checkNativeUpdate({ timeout: 8000 });
-        if (update) {
-          nativeUpdateRef.current = update;
-          const normalizedNotes = String(update.body || '').trim();
-          setNativeUpdateMeta({
-            version: update.version,
-            notes: normalizedNotes || undefined,
-          });
-          setUpdatePhase('available');
-          setUpdatePhaseMessage(`Update nativo disponible: ${update.version}.`);
-          console.info('[updater] update_available', { version: update.version });
-          toast.success(`Hay una actualización disponible: ${update.version}.`);
-          return;
+      const buildProbeFallbackStatus = (): UpdateStatus | null => {
+        if (updaterProbeFallbackMode === 'available') {
+          return {
+            ok: true,
+            current_version: __APP_VERSION__,
+            latest_version: '9.9.9-probe',
+            update_available: true,
+            download_url: 'https://example.invalid/botardium-installer.exe',
+            release_url: 'https://example.invalid/botardium-release',
+            notes: 'probe-available',
+          };
         }
 
-        nativeUpdateRef.current = null;
-        setNativeUpdateMeta(null);
-        setUpdatePhase('no_update');
-        setUpdatePhaseMessage(`Ya estás en la última versión (${__APP_VERSION__}).`);
-        console.info('[updater] check_ok', { update_available: false });
-        toast.success(`Ya estás en la última versión (${__APP_VERSION__}).`);
-        return;
+        if (updaterProbeFallbackMode === 'no_update') {
+          return {
+            ok: true,
+            current_version: __APP_VERSION__,
+            update_available: false,
+            notes: 'probe-no-update',
+          };
+        }
+
+        return null;
+      };
+
+      const reportUpdaterProbe = async (payload: Record<string, unknown>) => {
+        if (!updaterProbeEnabled || !isTauriDesktop()) return;
+
+        try {
+          await invoke('report_updater_probe', {
+            payload: JSON.stringify(payload),
+          });
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          console.warn('[updater] probe_report_failed', { detail });
+        }
+      };
+
+      const applyUpdateCheckResolution = (resolution: ReturnType<typeof resolveUpdateCheckState>, pendingNativeUpdate: Awaited<ReturnType<typeof checkNativeUpdate>> | null = null) => {
+        nativeUpdateRef.current = resolution.keepNativeUpdate ? pendingNativeUpdate : null;
+        setNativeUpdateMeta(resolution.nativeUpdateMeta);
+        setUpdatePhase(resolution.phase);
+        setUpdatePhaseMessage(resolution.message);
+
+        if (resolution.log) {
+          console[resolution.log.level](`[updater] ${resolution.log.event}`, resolution.log.payload);
+        }
+
+        if (!resolution.toast) return;
+        if (resolution.toast.level === 'success') {
+          toast.success(resolution.toast.message);
+          return;
+        }
+        if (resolution.toast.level === 'warning') {
+          toast.warning(resolution.toast.message);
+          return;
+        }
+        toast.error(resolution.toast.message);
+      };
+
+      if (isTauriDesktop()) {
+        try {
+          const update = await checkNativeUpdate({ timeout: 8000 });
+          const resolution = resolveUpdateCheckState({
+            runtime: 'desktop',
+            appVersion: __APP_VERSION__,
+            nativeUpdate: update,
+          });
+          applyUpdateCheckResolution(resolution, update);
+          await reportUpdaterProbe({
+            source: 'native',
+            resolution,
+            updaterProbeFallbackMode: updaterProbeFallbackMode || null,
+          });
+          return;
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'Error revisando actualizaciones.';
+          console.warn('[updater] error_code', { stage: 'check', detail });
+          const fallback = buildProbeFallbackStatus() || await mutateUpdateStatus().catch(() => null);
+          const resolution = resolveUpdateCheckState({
+            runtime: 'desktop',
+            appVersion: __APP_VERSION__,
+            nativeErrorDetail: detail,
+            fallbackStatus: fallback,
+          });
+          applyUpdateCheckResolution(resolution);
+          await reportUpdaterProbe({
+            source: 'native_error',
+            nativeErrorDetail: detail,
+            fallbackSource: buildProbeFallbackStatus() ? 'probe' : 'backend',
+            updaterProbeFallbackMode: updaterProbeFallbackMode || null,
+            fallback,
+            resolution,
+          });
+          return;
+        }
       }
 
       const data = await mutateUpdateStatus();
-      if (!data?.ok) {
-        setUpdatePhase('error');
-        setUpdatePhaseMessage(data?.detail || 'No pude consultar actualizaciones.');
-        toast.error(data?.detail || 'No pude consultar actualizaciones.');
-        return;
-      }
-      if (data.update_available) {
-        setUpdatePhase('fallback');
-        setUpdatePhaseMessage('Modo compatibilidad activo: update manual disponible.');
-        console.info('[updater] fallback_used', { reason: 'not_desktop_runtime' });
-        toast.success(`Hay una actualización disponible: ${data.latest_version}.`);
-        return;
-      }
-      setUpdatePhase('no_update');
-      setUpdatePhaseMessage(`Ya estás en la última versión (${data.current_version}).`);
-      toast.success(`Ya estás en la última versión (${data.current_version}).`);
+      applyUpdateCheckResolution(resolveUpdateCheckState({
+        runtime: 'browser',
+        appVersion: __APP_VERSION__,
+        fallbackStatus: data,
+      }));
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'Error revisando actualizaciones.';
       nativeUpdateRef.current = null;
       setNativeUpdateMeta(null);
-      setUpdatePhase('fallback');
-      setUpdatePhaseMessage('Updater nativo no disponible. Activando modo compatibilidad.');
-      console.warn('[updater] error_code', { stage: 'check', detail });
-
-      const fallback = await mutateUpdateStatus().catch(() => null);
-      if (fallback?.ok) {
-        if (fallback.update_available) {
-          setUpdatePhase('fallback');
-          setUpdatePhaseMessage('Modo compatibilidad activo: update manual disponible.');
-          toast.warning('Updater nativo no disponible. Podés descargar el instalador manualmente.');
-          return;
-        }
-
-        const fallbackVersion = fallback.current_version || __APP_VERSION__;
-        setUpdatePhase('no_update');
-        setUpdatePhaseMessage(`Ya estás en la última versión (${fallbackVersion}).`);
-        toast.success(`Ya estás en la última versión (${fallbackVersion}).`);
-        return;
-      }
-
       setUpdatePhase('error');
       setUpdatePhaseMessage(detail || 'No pude revisar actualizaciones.');
       toast.error(detail || 'Error revisando actualizaciones.');
+      await invoke('report_updater_probe', {
+        payload: JSON.stringify({
+          source: 'outer_error',
+          detail,
+        }),
+      }).catch(() => undefined);
     } finally {
       setIsCheckingUpdates(false);
       updateActionLockRef.current = false;
     }
   };
+
+  useEffect(() => {
+    if (!updaterProbeEnabled || !isTauriDesktop() || updaterProbeRanRef.current) return;
+    updaterProbeRanRef.current = true;
+    void checkForUpdates();
+  }, [updaterProbeEnabled]);
 
   const runLegacyUpdateFlow = async () => {
     if (!updateStatus?.download_url) {
