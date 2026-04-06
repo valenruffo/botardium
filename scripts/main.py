@@ -60,6 +60,8 @@ from scripts.runtime_config import (
     save_workspace_ai_config,
 )
 from scripts.auth import AuthActor, actor_from_request, build_session_payload
+from scripts.job_runtime import JobStatus, JobType, get_job_runtime, managed_job
+from scripts.rollout_flags import get_rollout_flags, latest_backup_snapshot
 
 try:
     from google import genai as google_genai
@@ -81,26 +83,82 @@ app = FastAPI(
     version="2.0.0"
 )
 
+STARTUP_STATE: Dict[str, Any] = {
+    "completed": False,
+    "error": None,
+    "last_started_at": None,
+}
+
+
+def _set_startup_state(*, completed: bool, error: Optional[str] = None) -> None:
+    STARTUP_STATE["completed"] = completed
+    STARTUP_STATE["error"] = error
+    STARTUP_STATE["last_started_at"] = datetime.utcnow().isoformat() + "Z"
+
+
+def _health_payload(*, include_discovery: bool = False) -> Dict[str, Any]:
+    path_info = verify_path_convergence()
+    rollout_flags = get_rollout_flags()
+    latest_snapshot = latest_backup_snapshot()
+    backup_ready = (not rollout_flags.require_backup_snapshot) or latest_snapshot is not None
+    startup_completed = bool(STARTUP_STATE.get("completed"))
+    startup_error = str(STARTUP_STATE.get("error") or "").strip()
+    path_ready = bool(path_info.get("converged")) or rollout_flags.path_mode == "shadow"
+    ready = startup_completed and not startup_error and path_ready and bool(path_info.get("db_exists"))
+    degraded_reasons: List[str] = []
+    if startup_error:
+        degraded_reasons.append(startup_error)
+    if not path_info.get("db_exists"):
+        degraded_reasons.append("authoritative_db_missing")
+    if not bool(path_info.get("converged")):
+        degraded_reasons.append(
+            "path_divergence_detected" if rollout_flags.path_mode == "shadow" else "path_cutover_blocked"
+        )
+    payload: Dict[str, Any] = {
+        "status": "ok" if ready else "degraded",
+        "ready": ready,
+        "version": _current_app_version(),
+        "checks": {
+            "startup_completed": startup_completed,
+            "path_converged": bool(path_info.get("converged")),
+            "db_exists": bool(path_info.get("db_exists")),
+            "backup_ready": backup_ready,
+        },
+        "startup": {
+            "completed": startup_completed,
+            "error": startup_error or None,
+            "last_started_at": STARTUP_STATE.get("last_started_at"),
+        },
+        "rollout": {
+            **rollout_flags.to_dict(),
+            "latest_backup_snapshot": str(latest_snapshot) if latest_snapshot else None,
+        },
+        "degraded_reasons": degraded_reasons,
+        "path_convergence": path_info,
+    }
+    if include_discovery:
+        payload["discovery"] = get_path_discovery_report()
+    return payload
+
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    path_info = verify_path_convergence()
-    return {
-        "status": "ok",
-        "version": _current_app_version(),
-        "path_convergence": path_info,
-    }
+    return _health_payload()
 
 
 @app.get("/health/detailed")
 async def health_detailed() -> Dict[str, Any]:
-    path_info = verify_path_convergence()
-    discovery = get_path_discovery_report()
+    payload = _health_payload(include_discovery=True)
+    payload["paths"] = payload.pop("path_convergence")
+    return payload
+
+
+@app.get("/api/ops/rollout")
+async def rollout_status() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "version": _current_app_version(),
-        "paths": path_info,
-        "discovery": discovery,
+        "rollout": _health_payload(include_discovery=True)["rollout"],
+        "health": _health_payload(include_discovery=True),
     }
 
 app.add_middleware(
@@ -195,7 +253,23 @@ def _audit_event(
 
 
 def _require_actor(request: Request) -> AuthActor:
-    return actor_from_request(request)
+    try:
+        return actor_from_request(request)
+    except HTTPException as exc:
+        rollout_flags = get_rollout_flags()
+        workspace_hint = int(request.query_params.get("workspace_id") or 0)
+        if exc.status_code != 401 or rollout_flags.auth_mode != "shadow" or workspace_hint <= 0:
+            raise
+        workspace = _workspace_record(workspace_hint)
+        return AuthActor(
+            actor_id=f"shadow-workspace:{workspace_hint}",
+            workspace_id=workspace_hint,
+            workspace_slug=workspace["workspace_slug"],
+            workspace_name=workspace["workspace_name"],
+            token_id="shadow-mode",
+            issued_at=0,
+            expires_at=0,
+        )
 
 
 def _authorize_workspace_scope(
@@ -898,18 +972,28 @@ def cleanup_legacy_message_previews() -> int:
 
 @app.on_event("startup")
 def startup_event():
-    init_db()
-    conn = _connect_db()
-    migrate_legacy_workspace_ai_secrets(conn)
-    conn.commit()
-    conn.close()
-    _ensure_leads_workspace_safe_schema()
-    _load_persisted_runtime_state()
-    cleanup_legacy_message_previews()
+    _set_startup_state(completed=False, error=None)
+    try:
+        rollout_flags = get_rollout_flags()
+        init_db()
+        conn = _connect_db()
+        migrate_legacy_workspace_ai_secrets(conn)
+        conn.commit()
+        conn.close()
+        _ensure_leads_workspace_safe_schema()
+        _load_persisted_runtime_state()
+        if rollout_flags.durable_jobs_mode == "enforce":
+            _recover_durable_outreach_jobs()
+            _recover_durable_campaign_jobs()
+        cleanup_legacy_message_previews()
 
-load_bootstrap_env()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-GOOGLE_API_KEY = get_bootstrap_ai_config()["google_api_key"]
+        load_bootstrap_env()
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+        GOOGLE_API_KEY = get_bootstrap_ai_config()["google_api_key"]
+    except Exception as exc:
+        _set_startup_state(completed=False, error=f"{type(exc).__name__}: {exc}")
+        raise
+    _set_startup_state(completed=True, error=None)
 
 # ----------------------------------------------------- #
 # Models
@@ -1076,6 +1160,135 @@ MESSAGE_JOB_STORE: Dict[str, Dict[str, Any]] = {}
 OUTREACH_TASKS: Dict[str, asyncio.Task] = {}  # Track outreach job tasks for cancellation
 
 
+def _campaign_job_field(action: str) -> str:
+    return "warmup_job_id" if action == "warmup" else "scrape_job_id"
+
+
+def _campaign_job_record(campaign: Dict[str, Any], action: str):
+    job_id = str(campaign.get(_campaign_job_field(action)) or "")
+    if not job_id:
+        return None
+    return get_job_runtime().get_job(job_id)
+
+
+def _campaign_has_active_job(campaign: Dict[str, Any], action: str) -> bool:
+    job = _campaign_job_record(campaign, action)
+    return bool(job and job.status in {JobStatus.PENDING.value, JobStatus.RUNNING.value})
+
+
+def _campaign_resume_message(action: str, checkpoint: str | None = None) -> str:
+    checkpoint_text = f" Punto de control: {checkpoint}." if checkpoint else ""
+    if action == "warmup":
+        return f"Botardium se reinicio. Reanudando warmup durable.{checkpoint_text}"
+    return f"Botardium se reinicio. Reanudando scraping durable.{checkpoint_text}"
+
+
+def _create_campaign_job(campaign: Dict[str, Any], action: str):
+    runtime = get_job_runtime()
+    existing = _campaign_job_record(campaign, action)
+    if existing and existing.status in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+        return existing
+
+    job_id = str(uuid4())
+    payload = {
+        "campaign_id": str(campaign["id"]),
+        "action": action,
+        "username": str(campaign.get("username") or ""),
+        "warmup_minutes": int(campaign.get("warmup_minutes") or 0),
+        "execution_mode": str(campaign.get("execution_mode") or "real"),
+        "workspace_id": int(campaign.get("workspace_id") or 0),
+    }
+    job = runtime.create_job(
+        job_id=job_id,
+        job_type=JobType.CAMPAIGN_WARMUP.value if action == "warmup" else JobType.SCRAPE_LEADS.value,
+        workspace_id=int(campaign.get("workspace_id") or 0),
+        payload=payload,
+    )
+    campaign[_campaign_job_field(action)] = job.job_id if job else job_id
+    _persist_campaign(campaign)
+    return job
+
+
+def _schedule_campaign_job(campaign: Dict[str, Any], action: str) -> bool:
+    campaign_id = str(campaign.get("id") or "")
+    if not campaign_id:
+        return False
+    existing_task = CAMPAIGN_TASKS.get(campaign_id)
+    if existing_task and not existing_task.done():
+        return False
+    job = _campaign_job_record(campaign, action)
+    if not job or job.status not in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    CAMPAIGN_TASKS[campaign_id] = loop.create_task(_run_campaign_runtime_job(campaign_id, action, job.job_id))
+    return True
+
+
+async def _run_campaign_runtime_job(campaign_id: str, action: str, job_id: str) -> None:
+    campaign = CAMPAIGN_STORE.get(campaign_id)
+    if not campaign:
+        return
+    runtime = get_job_runtime()
+    worker_id = f"campaign_{action}_{uuid4().hex[:8]}"
+    try:
+        with managed_job(job_id, worker_id, runtime) as ctx:
+            if action == "warmup":
+                await _run_campaign_warmup(campaign_id, ctx=ctx)
+            else:
+                await _run_campaign_scraping(campaign_id, ctx=ctx)
+            refreshed = CAMPAIGN_STORE.get(campaign_id) or campaign
+            ctx.complete(
+                {
+                    "campaign_id": campaign_id,
+                    "action": action,
+                    "status": str(refreshed.get("status") or ""),
+                    "progress": int(refreshed.get("progress") or 0),
+                }
+            )
+    except asyncio.CancelledError:
+        runtime.cancel_job(job_id)
+        raise
+    finally:
+        active_task = CAMPAIGN_TASKS.get(campaign_id)
+        if active_task is asyncio.current_task():
+            CAMPAIGN_TASKS.pop(campaign_id, None)
+
+
+def _recover_durable_campaign_jobs() -> List[str]:
+    runtime = get_job_runtime()
+    resumed: List[str] = []
+    for campaign in CAMPAIGN_STORE.values():
+        for action in ("warmup", "scrape"):
+            job = _campaign_job_record(campaign, action)
+            if not job or job.status not in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+                continue
+            if job.status == JobStatus.RUNNING.value and job.leased_by:
+                runtime.release_lease(job.job_id, str(job.leased_by))
+            campaign["current_action"] = _campaign_resume_message(action, job.checkpoint)
+            if action == "warmup":
+                campaign["status"] = "warmup"
+            else:
+                campaign["status"] = "running"
+            _append_campaign_log(campaign, campaign["current_action"])
+            if _schedule_campaign_job(campaign, action):
+                resumed.append(job.job_id)
+    return resumed
+
+
+def _cancel_campaign_jobs(campaign: Dict[str, Any]) -> None:
+    task = CAMPAIGN_TASKS.pop(str(campaign.get("id") or ""), None)
+    if task and not task.done():
+        task.cancel()
+    runtime = get_job_runtime()
+    for action in ("warmup", "scrape"):
+        job = _campaign_job_record(campaign, action)
+        if job and job.status in {JobStatus.PENDING.value, JobStatus.RUNNING.value}:
+            runtime.cancel_job(job.job_id)
+
+
 def _persist_campaign(campaign: Dict[str, Any]) -> None:
     conn = _connect_db()
     cursor = conn.cursor()
@@ -1193,6 +1406,106 @@ def _workspace_jobs(workspace_id: int) -> List[Dict[str, Any]]:
     for job in jobs:
         _normalize_message_job(job)
     return jobs
+
+
+def _apply_outreach_progress_update(job: Dict[str, Any], update: Dict[str, Any], initial_limit_used: int) -> None:
+    _normalize_message_job(job)
+    job["status"] = str(update.get("status") or job["status"])
+    job["progress"] = int(update.get("progress") or job["progress"])
+    job["current_action"] = str(update.get("current_action") or job["current_action"])
+    if "processed" in update:
+        job["processed"] = int(update.get("processed") or 0)
+    if "total" in update:
+        job["total"] = int(update.get("total") or 0)
+    if "current_lead" in update:
+        job["current_lead"] = str(update.get("current_lead") or "")
+    if "eta_seconds" in update:
+        try:
+            job["eta_seconds"] = max(0, int(update.get("eta_seconds") or 0))
+        except Exception:
+            job["eta_seconds"] = None
+    if "eta_min_seconds" in update:
+        try:
+            job["eta_min_seconds"] = max(0, int(update.get("eta_min_seconds") or 0))
+        except Exception:
+            job["eta_min_seconds"] = None
+    if "eta_max_seconds" in update:
+        try:
+            job["eta_max_seconds"] = max(0, int(update.get("eta_max_seconds") or 0))
+        except Exception:
+            job["eta_max_seconds"] = None
+    if update.get("drop_from_pending") and update.get("lead_id") is not None:
+        reserved_lead_id = int(update.get("lead_id") or 0)
+        if reserved_lead_id > 0:
+            pending_ids = [int(lead_id) for lead_id in (job.get("lead_ids_pending") or []) if int(lead_id) > 0]
+            job["lead_ids_pending"] = [lead_id for lead_id in pending_ids if lead_id != reserved_lead_id]
+    if isinstance(update.get("metrics"), dict):
+        merged = dict(job.get("metrics") or {})
+        merged.update(update.get("metrics") or {})
+        job["metrics"] = merged
+        if isinstance(job.get("limit"), dict):
+            sent_now = int(merged.get("sent") or 0)
+            cap_now = max(1, int(job["limit"].get("cap") or 50))
+            used_now = max(0, initial_limit_used + sent_now)
+            job["limit"]["used"] = used_now
+            job["limit"]["percent"] = int(min(100, round((used_now / cap_now) * 100)))
+    if update.get("checkpoint"):
+        job["checkpoint"] = str(update.get("checkpoint") or "")
+    if update.get("current_action"):
+        job.setdefault("logs", []).insert(0, {
+            "message": job["current_action"],
+            "timestamp": int(time.time()),
+        })
+        job["logs"] = job["logs"][:12]
+
+
+def _schedule_outreach_resume(job: Dict[str, Any]) -> bool:
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        return False
+    pending = [int(lead_id) for lead_id in (job.get("lead_ids_pending") or []) if int(lead_id) > 0]
+    if not pending:
+        return False
+    existing_task = OUTREACH_TASKS.get(job_id)
+    if existing_task and not existing_task.done():
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    OUTREACH_TASKS[job_id] = loop.create_task(
+        _run_message_outreach_job(job_id, pending, bool(job.get("dry_run")), job.get("campaign_id"))
+    )
+    return True
+
+
+def _recover_durable_outreach_jobs() -> List[str]:
+    resumed: List[str] = []
+    for job in MESSAGE_JOB_STORE.values():
+        normalized = _normalize_message_job(job)
+        if normalized.get("kind") != "outreach":
+            continue
+        if normalized.get("status") not in {"queued", "running"}:
+            continue
+        pending = [int(lead_id) for lead_id in (normalized.get("lead_ids_pending") or []) if int(lead_id) > 0]
+        if not pending:
+            if normalized.get("status") == "running":
+                normalized["status"] = "completed"
+                normalized["current_action"] = "Outreach recuperado tras reinicio sin leads pendientes."
+                _persist_message_job(normalized)
+            continue
+        if normalized.get("status") == "running":
+            normalized["status"] = "queued"
+            normalized["current_action"] = "Botardium se reinicio. Reanudando outreach pendiente desde el ultimo checkpoint durable."
+            normalized.setdefault("logs", []).insert(0, {
+                "message": normalized["current_action"],
+                "timestamp": int(time.time()),
+            })
+            normalized["logs"] = normalized["logs"][:12]
+            _persist_message_job(normalized)
+        if _schedule_outreach_resume(normalized):
+            resumed.append(str(normalized["id"]))
+    return resumed
 
 
 def _count_leads() -> int:
@@ -1722,7 +2035,7 @@ def _update_account_runtime(account_id: int, **fields: Any) -> None:
     conn.close()
 
 
-async def _run_account_warmup(account_id: int, username: str, duration_min: int, linked_campaign_id: Optional[str] = None) -> None:
+async def _run_account_warmup(account_id: int, username: str, duration_min: int, linked_campaign_id: Optional[str] = None, ctx=None) -> None:
     duration_min = max(1, min(duration_min, 30))
     started_at = time.time()
     _update_account_runtime(
@@ -1733,6 +2046,8 @@ async def _run_account_warmup(account_id: int, username: str, duration_min: int,
         current_action=f"Preparando warmeo real para @{username}",
         last_error="",
     )
+    if ctx:
+        ctx.update_progress(0.03, checkpoint="warmup:bootstrap")
 
     if linked_campaign_id and linked_campaign_id in CAMPAIGN_STORE:
         campaign = CAMPAIGN_STORE[linked_campaign_id]
@@ -1787,6 +2102,8 @@ async def _run_account_warmup(account_id: int, username: str, duration_min: int,
                 session_warmup_phase=phase_key,
                 current_action=phase,
             )
+            if ctx:
+                ctx.update_progress(min(0.94, progress / 100), checkpoint=f"warmup:{phase_key}")
             if linked_campaign_id and linked_campaign_id in CAMPAIGN_STORE:
                 campaign = CAMPAIGN_STORE[linked_campaign_id]
                 campaign["status"] = "warmup"
@@ -1820,6 +2137,8 @@ async def _run_account_warmup(account_id: int, username: str, duration_min: int,
             campaign["progress"] = 35
             campaign["current_action"] = "Warmup completo. Lista para comenzar scraping."
             _append_campaign_log(campaign, campaign["current_action"])
+        if ctx:
+            ctx.update_progress(1.0, checkpoint="warmup:completed")
     except asyncio.CancelledError:
         if worker and worker.poll() is None:
             worker.terminate()
@@ -1865,7 +2184,7 @@ async def _run_account_warmup(account_id: int, username: str, duration_min: int,
         ACCOUNT_WARMUP_TASKS.pop(account_id, None)
 
 
-async def _run_campaign_warmup(campaign_id: str) -> None:
+async def _run_campaign_warmup(campaign_id: str, ctx=None) -> None:
     campaign = CAMPAIGN_STORE.get(campaign_id)
     if not campaign:
         return
@@ -1882,7 +2201,7 @@ async def _run_campaign_warmup(campaign_id: str) -> None:
     if existing_task and not existing_task.done():
         raise RuntimeError(f"La cuenta @{campaign['username']} ya tiene un warmup corriendo.")
 
-    await _run_account_warmup(int(account["id"]), campaign["username"], int(campaign["warmup_minutes"]), linked_campaign_id=campaign_id)
+    await _run_account_warmup(int(account["id"]), campaign["username"], int(campaign["warmup_minutes"]), linked_campaign_id=campaign_id, ctx=ctx)
 
 
 async def _save_instagram_session(username: str, context, workspace_slug: Optional[str] = None) -> None:
@@ -1950,7 +2269,7 @@ async def _run_campaign_simulation(campaign_id: str) -> None:
     _append_campaign_log(campaign, "Pipeline de prueba completado sin tocar el CRM.")
 
 
-async def _run_campaign_scraping(campaign_id: str) -> None:
+async def _run_campaign_scraping(campaign_id: str, ctx=None) -> None:
     from scripts.lead_scraper import STATUS_FILE, run_scraper
 
     def _humanize_campaign_error(raw: str) -> str:
@@ -1978,6 +2297,8 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
         campaign["progress"] = max(int(campaign.get("progress") or 0), 5)
         campaign["current_action"] = "Reanudando extractor real de Instagram" if was_paused else "Inicializando extractor real de Instagram"
         _append_campaign_log(campaign, "Motor de scraping real reanudado." if was_paused else "Motor de scraping real inicializado.")
+        if ctx:
+            ctx.update_progress(0.05, checkpoint="scrape:bootstrap")
 
         sources = campaign.get("sources", [])
         executable_sources = [source for source in sources if source["type"] in {"hashtag", "followers", "location"}]
@@ -2019,6 +2340,11 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                 "status": "running",
             }
             _append_campaign_log(active_campaign, f"Ejecutando extractor real sobre {source_label}.")
+            if ctx:
+                ctx.update_progress(
+                    min(0.99, (index - 1) / max(1, len(executable_sources))),
+                    checkpoint=f"scrape:source:{index}:{source_label}:start",
+                )
             if STATUS_FILE.exists():
                 STATUS_FILE.unlink()
 
@@ -2069,6 +2395,11 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                             overall = int(((index - 1) + (source_percent / 100)) / len(executable_sources) * 100)
                             campaign["progress"] = min(99, max(campaign["progress"], overall))
                             campaign["current_action"] = f"{source_label} · {status_data.get('message', 'Extrayendo leads...')}"
+                            if ctx:
+                                ctx.update_progress(
+                                    min(0.99, overall / 100),
+                                    checkpoint=f"scrape:source:{index}:{source_label}:{source_progress}/{source_total}",
+                                )
                             meta = status_data.get("meta") or {}
                             campaign["source_stats"][source_label] = {
                                 "accepted": int(meta.get("accepted_count", 0)),
@@ -2091,6 +2422,11 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
                 campaign["progress"] = min(99, int(index / len(executable_sources) * 100))
                 campaign["source_stats"][source_label]["status"] = "done"
                 _append_campaign_log(campaign, f"Fuente completada: {source_label}.")
+                if ctx:
+                    ctx.update_progress(
+                        min(0.99, index / max(1, len(executable_sources))),
+                        checkpoint=f"scrape:source:{index}:{source_label}:done",
+                    )
             except Exception as source_exc:
                 campaign = CAMPAIGN_STORE.get(campaign_id)
                 if not campaign:
@@ -2141,6 +2477,8 @@ async def _run_campaign_scraping(campaign_id: str) -> None:
         else:
             campaign["current_action"] = f"Extraccion finalizada. {leads_delta} lead(s) nuevos enviados al CRM."
             _append_campaign_log(campaign, f"Campana completada. {leads_delta} lead(s) nuevos en CRM.")
+        if ctx:
+            ctx.update_progress(1.0, checkpoint="scrape:completed")
     except Exception as exc:
         campaign = CAMPAIGN_STORE.get(campaign_id)
         if campaign:
@@ -2185,6 +2523,8 @@ def _serialize_campaign(campaign: Dict[str, Any]) -> Dict[str, Any]:
         "current_action": campaign["current_action"],
         "progress": campaign["progress"],
         "created_at": campaign["created_at"],
+        "warmup_job_id": campaign.get("warmup_job_id"),
+        "scrape_job_id": campaign.get("scrape_job_id"),
         "logs": campaign.get("logs", []),
     }
 
@@ -2562,47 +2902,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
     main_loop = asyncio.get_running_loop()
 
     async def progress_hook(update: Dict[str, Any]) -> None:
-        _normalize_message_job(job)
-        job["status"] = str(update.get("status") or job["status"])
-        job["progress"] = int(update.get("progress") or job["progress"])
-        job["current_action"] = str(update.get("current_action") or job["current_action"])
-        if "processed" in update:
-            job["processed"] = int(update.get("processed") or 0)
-        if "total" in update:
-            job["total"] = int(update.get("total") or 0)
-        if "current_lead" in update:
-            job["current_lead"] = str(update.get("current_lead") or "")
-        if "eta_seconds" in update:
-            try:
-                job["eta_seconds"] = max(0, int(update.get("eta_seconds") or 0))
-            except Exception:
-                job["eta_seconds"] = None
-        if "eta_min_seconds" in update:
-            try:
-                job["eta_min_seconds"] = max(0, int(update.get("eta_min_seconds") or 0))
-            except Exception:
-                job["eta_min_seconds"] = None
-        if "eta_max_seconds" in update:
-            try:
-                job["eta_max_seconds"] = max(0, int(update.get("eta_max_seconds") or 0))
-            except Exception:
-                job["eta_max_seconds"] = None
-        if isinstance(update.get("metrics"), dict):
-            merged = dict(job.get("metrics") or {})
-            merged.update(update.get("metrics") or {})
-            job["metrics"] = merged
-            if isinstance(job.get("limit"), dict):
-                sent_now = int(merged.get("sent") or 0)
-                cap_now = max(1, int(job["limit"].get("cap") or 50))
-                used_now = max(0, initial_limit_used + sent_now)
-                job["limit"]["used"] = used_now
-                job["limit"]["percent"] = int(min(100, round((used_now / cap_now) * 100)))
-        if update.get("current_action"):
-            job.setdefault("logs", []).insert(0, {
-                "message": job["current_action"],
-                "timestamp": int(time.time()),
-            })
-            job["logs"] = job["logs"][:12]
+        _apply_outreach_progress_update(job, update, initial_limit_used)
         _persist_message_job(job)
 
     try:
@@ -2633,6 +2933,7 @@ async def _run_message_outreach_job(job_id: str, lead_ids: List[int], dry_run: b
                         lead_ids=lead_ids,
                         limit_override=len(lead_ids) if lead_ids else None,
                         progress_hook=sync_progress_hook,
+                        job_id=job_id,
                     )
                 )
             finally:
@@ -3707,6 +4008,8 @@ async def start_bot(config: CampaignStartRequest, request: Request):
         "created_at": int(time.time()),
         "logs": [],
         "source_stats": {},
+        "warmup_job_id": None,
+        "scrape_job_id": None,
     }
     _append_campaign_log(campaign, initial_action)
     CAMPAIGN_STORE[campaign_id] = campaign
@@ -3742,9 +4045,7 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
     action = payload.action.strip().lower()
 
     if action == "delete":
-        task = CAMPAIGN_TASKS.pop(campaign_id, None)
-        if task and not task.done():
-            task.cancel()
+        _cancel_campaign_jobs(campaign)
         conn = sqlite3.connect(str(DB_PATH))
         cursor = conn.cursor()
         cursor.execute("UPDATE leads SET campaign_id = NULL WHERE campaign_id = ?", (campaign_id,))
@@ -3766,10 +4067,11 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "start_warmup":
-        task = CAMPAIGN_TASKS.get(campaign_id)
-        if task and not task.done():
+        if _campaign_has_active_job(campaign, "warmup") or _campaign_has_active_job(campaign, "scrape"):
             raise HTTPException(status_code=400, detail="La campana ya esta ejecutandose.")
-        CAMPAIGN_TASKS[campaign_id] = asyncio.create_task(_run_campaign_warmup(campaign_id))
+        _create_campaign_job(campaign, "warmup")
+        if not _schedule_campaign_job(campaign, "warmup"):
+            raise HTTPException(status_code=500, detail="No se pudo encolar el warmup durable.")
         campaign["status"] = "warmup"
         campaign["progress"] = 5
         campaign["current_action"] = f"Warmup real en cola ({campaign['warmup_minutes']} min)"
@@ -3793,18 +4095,19 @@ async def bot_campaign_action(campaign_id: str, payload: CampaignActionRequest, 
         if not session_exists(campaign["username"], _workspace_slug(actor.workspace_id)):
             raise HTTPException(status_code=409, detail=f"No hay sesión válida para @{campaign['username']}. Re-loguea la cuenta desde la pestaña Cuentas para poder ejecutar.")
             
-        task = CAMPAIGN_TASKS.get(campaign_id)
-        if task and not task.done():
+        if _campaign_has_active_job(campaign, "warmup") or _campaign_has_active_job(campaign, "scrape"):
             raise HTTPException(status_code=400, detail="La campana ya esta ejecutandose.")
-        runner = _run_campaign_scraping if campaign.get("execution_mode") == "real" else _run_campaign_simulation
-        CAMPAIGN_TASKS[campaign_id] = asyncio.create_task(runner(campaign_id))
+        if campaign.get("execution_mode") != "real":
+            CAMPAIGN_TASKS[campaign_id] = asyncio.create_task(_run_campaign_simulation(campaign_id))
+        else:
+            _create_campaign_job(campaign, "scrape")
+            if not _schedule_campaign_job(campaign, "scrape"):
+                raise HTTPException(status_code=500, detail="No se pudo encolar el scraping durable.")
         _audit_event("campaign.start_scraping", actor, actor.workspace_id, "allowed", "campaign", resource_id=campaign_id)
         return {"status": "updated", "campaign": _serialize_campaign(campaign)}
 
     if action == "pause":
-        task = CAMPAIGN_TASKS.get(campaign_id)
-        if task and not task.done():
-            task.cancel()
+        _cancel_campaign_jobs(campaign)
         campaign["status"] = "paused"
         campaign["current_action"] = f"Scraping pausado en {int(campaign.get('progress') or 0)}%. Puedes reanudar cuando quieras."
         _append_campaign_log(campaign, campaign["current_action"])
@@ -3828,7 +4131,8 @@ async def emergency_stop_all(request: Request):
     
     try:
         # 1. Stop all campaign tasks
-        for campaign_id in list(CAMPAIGN_TASKS.keys()):
+        for campaign_id in list(CAMPAIGN_STORE.keys()):
+            campaign = CAMPAIGN_STORE.get(campaign_id)
             task = CAMPAIGN_TASKS.get(campaign_id)
             if task and not task.done():
                 task.cancel()
@@ -3836,9 +4140,9 @@ async def emergency_stop_all(request: Request):
                     await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
-            
-            campaign = CAMPAIGN_STORE.get(campaign_id)
+
             if campaign:
+                _cancel_campaign_jobs(campaign)
                 campaign["status"] = "stopped"
                 campaign["current_action"] = "Detenido por emergencia."
                 _append_campaign_log(campaign, campaign["current_action"])
@@ -4437,6 +4741,8 @@ async def get_message_jobs(workspace_id: int, request: Request):
         resource_id=str(workspace_id),
     )
     _auto_resume_paused_by_limit_jobs(workspace_id)
+    if get_rollout_flags().durable_jobs_mode == "enforce":
+        _recover_durable_outreach_jobs()
     jobs = sorted(_workspace_jobs(workspace_id), key=lambda job: job["created_at"], reverse=True)
     return {"jobs": [_serialize_message_job(job) for job in jobs[:20]]}
 

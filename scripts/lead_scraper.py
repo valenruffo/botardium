@@ -16,17 +16,21 @@ Uso:
 import asyncio
 import json
 import argparse
+import contextvars
 import logging
 import os
 import re
 import sys
 import time
 import random
+import uuid
+from datetime import datetime
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict
 from scripts.runtime_config import load_bootstrap_env
 from scripts.runtime_paths import PROFILE_PATH, SKILLS_DIR, SOURCE_ROOT, TMP_DIR
+from scripts.job_runtime import JobType, get_job_runtime, managed_job
 
 # Paths
 API_ROOT = SOURCE_ROOT
@@ -35,6 +39,8 @@ sys.path.insert(0, str(API_ROOT))
 sys.path.insert(0, str(SKILLS_DIR))
 
 STATUS_FILE = TMP_DIR / "scraper_status.json"
+RUNTIME_EVIDENCE_DIR = TMP_DIR / "runtime_failures"
+SCRAPER_STATUS_HOOK = contextvars.ContextVar("scraper_status_hook", default=None)
 
 # Imports del Core
 from scripts.session_manager import load_or_create_session
@@ -65,6 +71,65 @@ HASHTAG_LINK_SELECTORS = [
 ]
 
 
+def _sanitize_artifact_component(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip().lower())
+    return cleaned.strip("-._") or "runtime"
+
+
+async def _humanized_wait(min_seconds: float, max_seconds: float, reason: str) -> float:
+    delay = random.uniform(min_seconds, max(max_seconds, min_seconds))
+    logger.debug("Humanized wait %.2fs | %s", delay, reason)
+    await asyncio.sleep(delay)
+    return delay
+
+
+async def _capture_runtime_evidence(
+    page,
+    stage: str,
+    error: Exception | str | None = None,
+    *,
+    selector: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    RUNTIME_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stem = f"scraper_{_sanitize_artifact_component(stage)}_{timestamp}"
+    screenshot_path = RUNTIME_EVIDENCE_DIR / f"{stem}.png"
+    metadata_path = RUNTIME_EVIDENCE_DIR / f"{stem}.json"
+    detail = str(error).strip() if error is not None else ""
+    evidence: dict[str, Any] = {
+        "flow": "scraper",
+        "stage": stage,
+        "selector": selector or "",
+        "error": detail,
+        "timestamp": datetime.now().isoformat(),
+        "page_url": "",
+        "page_title": "",
+        "screenshot_path": "",
+        "extra": extra or {},
+    }
+
+    if page is not None:
+        try:
+            evidence["page_url"] = str(page.url or "")
+        except Exception as exc:
+            logger.debug("No pude leer page.url para evidencia scraper (%s): %s", stage, exc)
+        try:
+            evidence["page_title"] = str(await page.title())
+        except Exception as exc:
+            logger.debug("No pude leer title para evidencia scraper (%s): %s", stage, exc)
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True, timeout=5000)
+            evidence["screenshot_path"] = str(screenshot_path)
+        except Exception as exc:
+            evidence["screenshot_error"] = str(exc)
+            logger.warning("No pude guardar screenshot de scraper en %s: %s", screenshot_path, exc)
+
+    metadata_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.warning("Evidencia de scraper guardada en %s", metadata_path)
+    return evidence
+
+
 async def _open_location_target(context, page, query: str):
     """Resuelve una location usando el endpoint interno de search y navega al lugar."""
     search_url = f"https://www.instagram.com/web/search/topsearch/?context=place&query={quote(query)}"
@@ -78,7 +143,7 @@ async def _open_location_target(context, page, query: str):
         fallback_url = f"https://www.instagram.com/explore/search/keyword/?q={quote(query)}"
         update_scraper_status("running", 0, 0, f"Topsearch sin places. Fallback a {fallback_url}...")
         await page.goto(fallback_url, wait_until="domcontentloaded", timeout=20000)
-        await asyncio.sleep(3)
+        await _humanized_wait(2.2, 4.6, "location fallback search settle")
         return
 
     location = (places[0] or {}).get("place", {}).get("location", {})
@@ -90,7 +155,7 @@ async def _open_location_target(context, page, query: str):
     target_url = f"https://www.instagram.com/explore/locations/{pk}/{quote(str(slug).replace(' ', '-'))}/"
     update_scraper_status("running", 0, 0, f"Location encontrada. Navegando a {target_url}...")
     await page.goto(target_url, wait_until="domcontentloaded", timeout=20000)
-    await asyncio.sleep(3)
+    await _humanized_wait(2.2, 4.6, "location page settle")
 
 
 async def _collect_post_links(page) -> list[str]:
@@ -103,7 +168,8 @@ async def _collect_post_links(page) -> list[str]:
             )
             if isinstance(hrefs, list):
                 links.extend(str(href) for href in hrefs)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Fallo leyendo links con selector %s: %s", selector, exc)
             continue
     deduped: list[str] = []
     seen: set[str] = set()
@@ -207,7 +273,7 @@ async def _extract_author_via_grid_click(page, href: str, own_username: str, sou
         ))
         if not clicked:
             return None
-        await asyncio.sleep(2.0)
+        await _humanized_wait(1.5, 3.2, "post modal settle after click")
 
         # Try DOM-based extraction first
         candidate_username = await asyncio.wait_for(_extract_post_author_username(page, own_username), timeout=4)
@@ -226,9 +292,11 @@ async def _extract_author_via_grid_click(page, href: str, own_username: str, sou
                         candidate_username = at_match.group(1).lower()
                     elif " on Instagram" in og_title:
                         candidate_username = og_title.split(" on Instagram")[0].strip().lower()
-            except Exception:
-                pass
-    except Exception:
+            except Exception as exc:
+                logger.debug("No pude leer og:title para post %s: %s", cleaned, exc)
+    except Exception as exc:
+        logger.warning("Fallo extrayendo autor via grid click para %s: %s", cleaned, exc)
+        await _capture_runtime_evidence(page, "grid_click_author", exc, selector=cleaned, extra={"source_url": source_url})
         candidate_username = None
     finally:
         try:
@@ -237,13 +305,15 @@ async def _extract_author_via_grid_click(page, href: str, own_username: str, sou
                 await asyncio.wait_for(page.go_back(wait_until="domcontentloaded", timeout=10000), timeout=12)
             else:
                 await asyncio.wait_for(page.keyboard.press("Escape"), timeout=3)
-                await asyncio.sleep(0.5)
-        except Exception:
+                await _humanized_wait(0.35, 0.9, "post dialog close settle")
+        except Exception as exc:
+            logger.debug("No pude volver con go_back/Escape desde %s: %s", current_url if 'current_url' in locals() else cleaned, exc)
             try:
                 await asyncio.wait_for(page.goto(source_url, wait_until="domcontentloaded", timeout=20000), timeout=22)
-                await asyncio.sleep(1)
-            except Exception:
-                pass
+                await _humanized_wait(0.8, 1.8, "restore source url after grid click failure")
+            except Exception as restore_exc:
+                logger.warning("No pude restaurar la pagina origen %s: %s", source_url, restore_exc)
+                await _capture_runtime_evidence(page, "grid_click_restore", restore_exc, extra={"source_url": source_url})
 
     if candidate_username and candidate_username == own_username:
         return None
@@ -255,7 +325,8 @@ async def _collect_selector_counts(page, selectors: list[str]) -> dict[str, int]
     for selector in selectors:
         try:
             counts[selector] = await page.locator(selector).count()
-        except Exception:
+        except Exception as exc:
+            logger.debug("No pude contar selector %s: %s", selector, exc)
             counts[selector] = 0
     return counts
 
@@ -271,13 +342,15 @@ async def _collect_hashtag_page_diagnostics(page, hashtag: str) -> dict[str, Any
     current_url = str(page.url or "")
     try:
         title = await page.title()
-    except Exception:
+    except Exception as exc:
+        logger.debug("No pude leer title del hashtag %s: %s", hashtag, exc)
         title = ""
     try:
         canonical = await page.evaluate(
             """() => document.querySelector('link[rel="canonical"]')?.getAttribute('href') || ''"""
         )
-    except Exception:
+    except Exception as exc:
+        logger.debug("No pude leer canonical del hashtag %s: %s", hashtag, exc)
         canonical = ""
     total_links = int(sum(selector_counts.values()))
     normalized = _normalize_hashtag(hashtag)
@@ -302,7 +375,7 @@ async def _wait_for_hashtag_grid(page, hashtag: str, rounds: int = 4) -> dict[st
     best: dict[str, Any] = {}
     best_links = -1
     for attempt in range(rounds):
-        await asyncio.sleep(1 + attempt)
+        await _humanized_wait(0.8 + attempt, 1.6 + attempt, f"wait for hashtag grid attempt {attempt + 1}")
         diag = await _collect_hashtag_page_diagnostics(page, hashtag)
         links = int(diag.get("total_post_links") or 0)
         if links > best_links:
@@ -328,7 +401,7 @@ async def _open_hashtag_via_search(page, hashtag: str) -> bool:
 
     search_url = f"https://www.instagram.com/explore/search/keyword/?q=%23{quote(normalized)}"
     await page.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-    await asyncio.sleep(2)
+    await _humanized_wait(1.5, 3.1, "hashtag search results settle")
 
     link_selectors = [
         f"a[href*='/explore/tags/{normalized}/']",
@@ -349,12 +422,14 @@ async def _open_hashtag_via_search(page, hashtag: str) -> bool:
                 await candidate.click(timeout=2500)
                 try:
                     await page.wait_for_url(f"**/explore/tags/{normalized}/**", timeout=5000)
-                except Exception:
-                    await asyncio.sleep(2)
+                except Exception as exc:
+                    logger.debug("wait_for_url no confirmó hashtag %s: %s", normalized, exc)
+                    await _humanized_wait(1.4, 2.9, "hashtag click fallback settle")
                 current_url = page.url.lower()
                 if "/explore/tags/" in current_url and normalized in current_url:
                     return True
-            except Exception:
+            except Exception as exc:
+                logger.debug("Click de hashtag %s falló con selector %s: %s", normalized, selector, exc)
                 continue
 
     return False
@@ -531,6 +606,86 @@ def update_scraper_status(status: str, progress: int, total: int, message: str, 
         "meta": meta or {},
     }
     STATUS_FILE.write_text(json.dumps(data), encoding="utf-8")
+    hook = SCRAPER_STATUS_HOOK.get()
+    if callable(hook):
+        hook(data)
+
+
+def _scraper_checkpoint_from_status(data: Dict[str, Any]) -> str:
+    meta = data.get("meta") or {}
+    source = str(meta.get("source") or "scraper")
+    status = str(data.get("status") or "running")
+    progress = int(data.get("progress") or 0)
+    total = max(1, int(data.get("total") or 1))
+    return f"{source}:{status}:{progress}/{total}"[:220]
+
+
+def _install_runtime_status_hook(job_ctx, total: int):
+    safe_total = max(1, int(total) or 1)
+
+    def _hook(data: Dict[str, Any]) -> None:
+        progress = int(data.get("progress") or 0)
+        fraction = max(0.0, min(1.0, progress / safe_total))
+        job_ctx.update_progress(fraction, checkpoint=_scraper_checkpoint_from_status(data))
+
+    return SCRAPER_STATUS_HOOK.set(_hook)
+
+
+def enqueue_scraper_job(
+    target_type: str,
+    query: str,
+    limit: int = 50,
+    username: str | None = None,
+    filters: dict[str, Any] | None = None,
+    campaign_id: str | None = None,
+    workspace_id: int = 1,
+    runtime=None,
+):
+    job_runtime = runtime or get_job_runtime()
+    idempotency_key = job_runtime.generate_idempotency_key(
+        "scrape",
+        str(workspace_id),
+        str(target_type),
+        str(query).strip().lower(),
+        str(limit),
+        str(username or ""),
+        str(campaign_id or ""),
+        json.dumps(filters or {}, sort_keys=True, ensure_ascii=True),
+    )
+    return job_runtime.create_job(
+        job_id=f"scrape_{uuid.uuid4().hex[:12]}",
+        job_type=JobType.SCRAPE_LEADS.value,
+        workspace_id=int(workspace_id),
+        payload={
+            "target_type": target_type,
+            "query": query,
+            "limit": int(limit),
+            "username": username,
+            "filters": filters or {},
+            "campaign_id": campaign_id,
+        },
+        idempotency_key=idempotency_key,
+    )
+
+
+async def resume_scraper_job(job_id: str, runtime=None):
+    job_runtime = runtime or get_job_runtime()
+    job = job_runtime.get_job(job_id)
+    if not job:
+        raise RuntimeError(f"Scraper job {job_id} no encontrado")
+    payload = job.payload or {}
+    if isinstance(payload, str):
+        payload = json.loads(payload or "{}")
+    return await run_scraper(
+        str(payload.get("target_type") or ""),
+        str(payload.get("query") or ""),
+        int(payload.get("limit") or 50),
+        username=payload.get("username"),
+        filters=payload.get("filters") or {},
+        campaign_id=payload.get("campaign_id"),
+        job_id=job_id,
+        workspace_id=int(job.workspace_id or 1),
+    )
 
 # Filtros de Calidad: Leads B2B / High Ticket
 TARGET_KEYWORDS = [
@@ -923,7 +1078,7 @@ async def _extract_counts_from_profile_header(page) -> tuple[int, int]:
 
 async def _extract_profile_snapshot(page, username: str) -> dict[str, Any]:
     await page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
-    await asyncio.sleep(2)
+    await _humanized_wait(1.4, 3.1, f"profile snapshot settle @{username}")
 
     og_title = await page.evaluate(
         """() => document.querySelector('meta[property="og:title"]')?.getAttribute('content') || ''"""
@@ -964,8 +1119,8 @@ async def _extract_profile_snapshot(page, username: str) -> dict[str, Any]:
             body_lower = body_text.lower()
             if "this account is private" in body_lower or "esta cuenta es privada" in body_lower:
                 is_private = True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("No pude detectar privacidad leyendo body de @%s: %s", username, exc)
     # If og:description is very short/empty AND posts_count is 0, likely private
     if not is_private and len(og_description.strip()) < 10 and posts_count == 0:
         is_private = True
@@ -1089,8 +1244,8 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
                 if un and un != own_username and un not in api_captured_usernames:
                     api_captured_usernames.add(un)
                     api_captured_owners.append(owner)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("No pude parsear respuesta interceptada %s: %s", response.url, exc)
 
     # Register the API interceptor
     page.on("response", lambda resp: asyncio.ensure_future(_intercept_hashtag_response(resp)))
@@ -1168,9 +1323,11 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
             # Without full bio, niche filters produce false rejections.
             try:
                 profile = await _extract_profile_snapshot(profile_page, candidate_username)
-            except Exception:
+            except Exception as exc:
                 extracted_params["diagnostics"]["profile_errors"] = extracted_params["diagnostics"].get("profile_errors", 0) + 1
                 extracted_params.setdefault("rejected", {})["perfil_no_legible"] = extracted_params.setdefault("rejected", {}).get("perfil_no_legible", 0) + 1
+                logger.warning("No pude extraer snapshot para @%s via API: %s", candidate_username, exc)
+                await _capture_runtime_evidence(profile_page, "profile_snapshot_api", exc, extra={"username": candidate_username, "query": query})
                 continue
 
             is_valid, reason = _is_valid_lead(
@@ -1198,7 +1355,7 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
             else:
                 extracted_params.setdefault("rejected", {})["duplicado"] = extracted_params.setdefault("rejected", {}).get("duplicado", 0) + 1
 
-            await asyncio.sleep(random.uniform(0.3, 0.8))
+            await _humanized_wait(0.3, 0.8, f"between API author validations @{candidate_username}")
 
             update_scraper_status(
                 "running",
@@ -1244,9 +1401,11 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
 
                 try:
                     profile = await _extract_profile_snapshot(profile_page, candidate_username)
-                except Exception:
+                except Exception as exc:
                     extracted_params["diagnostics"]["profile_errors"] = extracted_params["diagnostics"].get("profile_errors", 0) + 1
                     extracted_params.setdefault("rejected", {})["perfil_no_legible"] = extracted_params.setdefault("rejected", {}).get("perfil_no_legible", 0) + 1
+                    logger.warning("No pude extraer snapshot para @%s via grid click: %s", candidate_username, exc)
+                    await _capture_runtime_evidence(profile_page, "profile_snapshot_grid", exc, extra={"username": candidate_username, "query": query, "href": href})
                     continue
 
                 is_valid, reason = _is_valid_lead(
@@ -1274,7 +1433,7 @@ async def _collect_post_authors(page, query: str, target_type: str, db: Database
                 else:
                     extracted_params.setdefault("rejected", {})["duplicado"] = extracted_params.setdefault("rejected", {}).get("duplicado", 0) + 1
 
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+                await _humanized_wait(1.0, 2.0, f"between grid author validations @{candidate_username}")
     finally:
         await profile_page.close()
 
@@ -1485,7 +1644,67 @@ def _extract_users_from_json(data: dict) -> list:
     return list(unique_users.values())
 
 
-async def run_scraper(target_type: str, query: str, limit: int = 50, username: str | None = None, filters: dict[str, Any] | None = None, campaign_id: str | None = None):
+async def run_scraper(
+    target_type: str,
+    query: str,
+    limit: int = 50,
+    username: str | None = None,
+    filters: dict[str, Any] | None = None,
+    campaign_id: str | None = None,
+    job_id: str | None = None,
+    worker_id: str | None = None,
+    workspace_id: int = 1,
+    job_ctx=None,
+):
+    if job_ctx is not None:
+        token = _install_runtime_status_hook(job_ctx, limit)
+        try:
+            return await _run_scraper_impl(target_type, query, limit, username=username, filters=filters, campaign_id=campaign_id)
+        finally:
+            SCRAPER_STATUS_HOOK.reset(token)
+
+    if not job_id:
+        return await _run_scraper_impl(target_type, query, limit, username=username, filters=filters, campaign_id=campaign_id)
+
+    runtime = get_job_runtime()
+    worker = worker_id or f"scraper_{uuid.uuid4().hex[:8]}"
+    job = runtime.create_job(
+        job_id=job_id,
+        job_type=JobType.SCRAPE_LEADS.value,
+        workspace_id=int(workspace_id),
+        payload={
+            "target_type": target_type,
+            "query": query,
+            "limit": int(limit),
+            "username": username,
+            "filters": filters or {},
+            "campaign_id": campaign_id,
+        },
+        idempotency_key=runtime.generate_idempotency_key(
+            "scrape",
+            str(workspace_id),
+            str(target_type),
+            str(query).strip().lower(),
+            str(limit),
+            str(username or ""),
+            str(campaign_id or ""),
+            json.dumps(filters or {}, sort_keys=True, ensure_ascii=True),
+        ),
+    )
+    if job and job.status == "completed":
+        return json.loads(job.result or "{}") if job.result else {"accepted_count": 0}
+
+    with managed_job(job_id, worker, runtime) as ctx:
+        token = _install_runtime_status_hook(ctx, limit)
+        try:
+            result = await _run_scraper_impl(target_type, query, limit, username=username, filters=filters, campaign_id=campaign_id)
+            ctx.complete(result)
+            return result
+        finally:
+            SCRAPER_STATUS_HOOK.reset(token)
+
+
+async def _run_scraper_impl(target_type: str, query: str, limit: int = 50, username: str | None = None, filters: dict[str, Any] | None = None, campaign_id: str | None = None):
     """
     Ejecuta el scraper abriendo el browser y navegando al target.
     """
@@ -1502,8 +1721,8 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
         try:
             profile = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
             ig_username = profile.get("ig_username", "").lower()
-        except:
-            pass
+        except Exception as exc:
+            logger.warning("No pude leer account_profile.json para auto-abort del scraper: %s", exc)
 
     db = DatabaseManager()
     browser = None
@@ -1632,7 +1851,7 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
             if ig_username and f"/{ig_username}/" in page.url.lower():
                 raise Exception("🚨 AUTO-ABORT: El bot aterrizó en tu propio perfil. Cancelando scraping para proteger tus seguidores de DMs accidentales.")
                 
-            await asyncio.sleep(random.uniform(4, 8))
+            await _humanized_wait(4.0, 8.0, "post-navigation settle before scraping")
 
             # En caso de followers, IG requiere abrir el modal manualmente a veces
             if target_type == "followers":
@@ -1642,7 +1861,7 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
                     followers_link = page.locator(f"a[href='/{query}/followers/']").first
                     if await followers_link.is_visible():
                         await followers_link.click()
-                        await asyncio.sleep(3)
+                        await _humanized_wait(2.2, 4.4, "followers modal settle")
                     else:
                         logger.warning("No se encontro el link de followers. Asegurate de que la cuenta es publica.")
                 except Exception as e:
@@ -1674,14 +1893,15 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
                         modal = page.locator('div[role="dialog"] >> div[style*="overflow-y"]')
                         try:
                             await modal.evaluate("el => el.scrollTop = el.scrollHeight")
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug("Fallback scroll dentro del modal de followers: %s", exc)
                             # Fallback scroll
                             await page.mouse.wheel(0, 1000)
                     else:
                         # Scrollear pagina normal (hashtag)
                         await page.mouse.wheel(0, random.randint(1500, 3000))
 
-                    await asyncio.sleep(random.uniform(2, 5))
+                    await _humanized_wait(2.0, 5.0, "deep scroll settle")
                     scrolls += 1
 
                     # Update UI via JSON
@@ -1713,6 +1933,17 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
             detail = str(e).strip() or repr(e)
             last_error = detail
             logger.exception("Error durante scraping real")
+            evidence = await _capture_runtime_evidence(
+                page,
+                "run_scraper_impl",
+                e,
+                extra={
+                    "source": extracted_params.get("source"),
+                    "accepted_count": extracted_params.get("total", 0),
+                    "query": query,
+                    "target_type": target_type,
+                },
+            )
             update_scraper_status(
                 "error",
                 extracted_params["total"],
@@ -1727,14 +1958,16 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
                     "profile_errors": int(extracted_params.get("diagnostics", {}).get("profile_errors", 0)),
                     "page_diagnostics": extracted_params.get("diagnostics", {}).get("page_diag", {}),
                     "precheck": extracted_params.get("diagnostics", {}).get("precheck", {}),
+                    "runtime_evidence": evidence,
                 },
             )
             raise
     except Exception as e:
         detail = str(e).strip() or repr(e)
+        evidence = await _capture_runtime_evidence(page, "run_scraper_fatal", e, extra={"query": query, "target_type": target_type})
         if not last_error:
             last_error = detail
-            update_scraper_status("error", extracted_params["total"], limit, f"Error fatal: {detail}")
+            update_scraper_status("error", extracted_params["total"], limit, f"Error fatal: {detail}", meta={"runtime_evidence": evidence})
         logger.exception("Scraper abortado por error fatal")
         raise
     finally:
@@ -1767,9 +2000,18 @@ async def run_scraper(target_type: str, query: str, limit: int = 50, username: s
             logger.error(f"❌ Scraping finalizado con error temprano: {last_error or 'sin detalle'}")
 
         # Esperar un momento a que terminen de procesar las ultimas requests
-        await asyncio.sleep(2)
+        await _humanized_wait(1.5, 2.8, "final scraper drain")
         if browser is not None:
             await browser.close()
+
+    return {
+        "accepted_count": int(extracted_params.get("total") or 0),
+        "source": extracted_params.get("source"),
+        "rejected": extracted_params.get("rejected", {}),
+        "campaign_id": campaign_id or "",
+        "target_type": target_type,
+        "query": query,
+    }
 
 
 if __name__ == "__main__":

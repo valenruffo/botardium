@@ -33,6 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(AGENTS_DIR))
 
 EMERGENCY_FLAG = TMP_DIR / "emergency_stop.flag"
+RUNTIME_EVIDENCE_DIR = TMP_DIR / "runtime_failures"
 
 from scripts.session_manager import load_or_create_session
 from skills.db_manager import DatabaseManager
@@ -49,6 +50,65 @@ from scripts.job_runtime import (
 )
 
 logger = logging.getLogger("primebot.outreach")
+
+
+def _sanitize_artifact_component(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value or "").strip().lower())
+    return cleaned.strip("-._") or "runtime"
+
+
+async def _humanized_wait(min_seconds: float, max_seconds: float, reason: str) -> float:
+    delay = random.uniform(min_seconds, max(max_seconds, min_seconds))
+    logger.debug("Humanized wait %.2fs | %s", delay, reason)
+    await asyncio.sleep(delay)
+    return delay
+
+
+async def _capture_outreach_evidence(
+    page,
+    stage: str,
+    error: Exception | str | None = None,
+    *,
+    selector: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    RUNTIME_EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stem = f"outreach_{_sanitize_artifact_component(stage)}_{timestamp}"
+    screenshot_path = RUNTIME_EVIDENCE_DIR / f"{stem}.png"
+    metadata_path = RUNTIME_EVIDENCE_DIR / f"{stem}.json"
+    detail = str(error).strip() if error is not None else ""
+    evidence: dict[str, Any] = {
+        "flow": "outreach",
+        "stage": stage,
+        "selector": selector or "",
+        "error": detail,
+        "timestamp": datetime.now().isoformat(),
+        "page_url": "",
+        "page_title": "",
+        "screenshot_path": "",
+        "extra": extra or {},
+    }
+
+    if page is not None:
+        try:
+            evidence["page_url"] = str(page.url or "")
+        except Exception as exc:
+            logger.debug("No pude leer page.url para evidencia outreach (%s): %s", stage, exc)
+        try:
+            evidence["page_title"] = str(await page.title())
+        except Exception as exc:
+            logger.debug("No pude leer title para evidencia outreach (%s): %s", stage, exc)
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=True, timeout=5000)
+            evidence["screenshot_path"] = str(screenshot_path)
+        except Exception as exc:
+            evidence["screenshot_error"] = str(exc)
+            logger.warning("No pude guardar screenshot de outreach en %s: %s", screenshot_path, exc)
+
+    metadata_path.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    logger.warning("Evidencia de outreach guardada en %s", metadata_path)
+    return evidence
 
 
 def _load_profile() -> dict:
@@ -72,14 +132,14 @@ async def _check_anti_pattern(page, memory_log: dict) -> bool:
                 logger.error(f"🚨 ALERTA ANTI-PATTERN: Activado '{sel}'")
                 memory_log["popups"].append({"type": "ACTION_BLOCKED", "timestamp": datetime.now().isoformat()})
                 return True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("No pude validar anti-pattern selector %s: %s", sel, exc)
     return False
 
 
-async def _open_message_composer(page) -> bool:
-    import re
-    print("[DEBUG _open_message_composer] Intentando JS click nativo...")
+async def _open_message_composer(page, username: str = "") -> bool:
+    attempt_errors: list[dict[str, str]] = []
+    logger.debug("Intentando abrir composer DM para @%s via JS nativo", username or "unknown")
     # 1. Prio 1: JS Native Click (most robust against React layout / overlay issues)
     js_click_code = """
     () => {
@@ -97,21 +157,23 @@ async def _open_message_composer(page) -> bool:
     """
     try:
         clicked = await page.evaluate(js_click_code)
-        print(f"[DEBUG _open_message_composer] JS eval returned: {clicked}")
+        logger.debug("JS eval para composer @%s devolvió %s", username or "unknown", clicked)
         if clicked:
-            await asyncio.sleep(random.uniform(3, 6))
+            await _humanized_wait(3.0, 6.0, f"composer settle after JS click @{username}")
             try:
                 # relax visibility check, just check DOM presence first
                 c = await page.locator('div[role="textbox"]').count()
-                print(f"[DEBUG _open_message_composer] textbox count: {c}")
+                logger.debug("textbox count para composer @%s: %s", username or "unknown", c)
                 if c > 0:
                     return True
             except Exception as e:
-                print(f"[DEBUG _open_message_composer] textbox error: {e}")
+                attempt_errors.append({"strategy": "js_click_textbox_check", "error": str(e)})
+                logger.debug("Error chequeando textbox tras JS click para @%s: %s", username or "unknown", e)
     except Exception as e:
-        print(f"[DEBUG _open_message_composer] JS eval exception: {e}")
+        attempt_errors.append({"strategy": "js_click", "error": str(e)})
+        logger.debug("JS eval exception para composer @%s: %s", username or "unknown", e)
 
-    print("[DEBUG _open_message_composer] JS falló, probando fallback 1 (get_by_role)...")
+    logger.debug("JS falló para composer @%s, probando get_by_role", username or "unknown")
     # 2. Prio 2: Fallback to exact matches by role (Playwright internal)
     try:
         buttons = page.get_by_role("button", name=re.compile(r"^(Message|Mensaje|Enviar mensaje)$", re.I))
@@ -122,15 +184,17 @@ async def _open_message_composer(page) -> bool:
                 await btn.wait_for(state="visible", timeout=2000)
                 if await btn.is_visible():
                     await btn.click(timeout=5000, force=True)
-                    await asyncio.sleep(random.uniform(3, 5))
+                    await _humanized_wait(3.0, 5.0, f"composer settle after role click @{username}")
                     if await page.locator('div[role="textbox"]').count() > 0:
                         return True
-            except Exception:
+            except Exception as exc:
+                attempt_errors.append({"strategy": f"role_button_{i}", "error": str(exc)})
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        attempt_errors.append({"strategy": "role_query", "error": str(exc)})
+        logger.debug("Fallback get_by_role falló para @%s: %s", username or "unknown", exc)
 
-    print("[DEBUG _open_message_composer] Fallback 1 falló, probando fallback 2 (selectors)...")
+    logger.debug("Fallback get_by_role falló para @%s, probando selectors", username or "unknown")
     # 3. Prio 3: Fallback locators
     selectors = [
         'div[role="button"]:text-is("Message")',
@@ -150,15 +214,17 @@ async def _open_message_composer(page) -> bool:
                     await btn.wait_for(state="visible", timeout=2000)
                     if await btn.is_visible():
                         await btn.click(timeout=5000, force=True)
-                        await asyncio.sleep(random.uniform(3, 5))
+                        await _humanized_wait(3.0, 5.0, f"composer settle after selector click @{username}")
                         if await page.locator('div[role="textbox"]').count() > 0:
                             return True
-                except Exception:
+                except Exception as exc:
+                    attempt_errors.append({"strategy": f"selector:{selector}:{i}", "error": str(exc)})
                     continue
-        except Exception:
+        except Exception as exc:
+            attempt_errors.append({"strategy": f"selector_query:{selector}", "error": str(exc)})
             continue
 
-    print("[DEBUG _open_message_composer] Fallback 2 falló, probando fallback 3 (get_by_text)...")
+    logger.debug("Fallback selectors falló para @%s, probando get_by_text", username or "unknown")
     text_locators = [
         page.get_by_text(re.compile(r"^message$", re.I)),
         page.get_by_text(re.compile(r"^mensaje$", re.I)),
@@ -172,15 +238,24 @@ async def _open_message_composer(page) -> bool:
                 try:
                     await btn.wait_for(state="visible", timeout=2000)
                     await btn.click(timeout=5000, force=True)
-                    await asyncio.sleep(random.uniform(3, 5))
+                    await _humanized_wait(3.0, 5.0, f"composer settle after text click @{username}")
                     if await page.locator('div[role="textbox"]').count() > 0:
                         return True
-                except Exception:
+                except Exception as exc:
+                    attempt_errors.append({"strategy": f"text_locator_{i}", "error": str(exc)})
                     continue
-        except Exception:
+        except Exception as exc:
+            attempt_errors.append({"strategy": "text_query", "error": str(exc)})
             continue
 
-    print("[DEBUG _open_message_composer] TODOS LOS INTENTOS FALLARON.")
+    logger.warning("No pude abrir el composer DM para @%s. intentos=%s", username or "unknown", attempt_errors)
+    await _capture_outreach_evidence(
+        page,
+        "open_message_composer",
+        "No se encontró un composer visible tras múltiples estrategias",
+        selector="message_button",
+        extra={"username": username, "attempts": attempt_errors},
+    )
     return False
 
 
@@ -426,11 +501,11 @@ async def _run_outreach_impl(
             max_per_lead = max(min_per_lead + 15, min(3600, observed_max))
         return remaining * min_per_lead, remaining * max_per_lead
 
-    def _update_job_progress(current: int, total: int, current_lead: str):
+    def _update_job_progress(current: int, total: int, current_lead: str, checkpoint: Optional[str] = None):
         if ctx:
             progress = current / max(total, 1)
-            checkpoint = f"lead_{current}:{current_lead}"
-            ctx.update_progress(progress, checkpoint)
+            durable_checkpoint = checkpoint or f"lead_{current}:{current_lead}"
+            ctx.update_progress(progress, durable_checkpoint)
     
     try:
         # BATCHING: Procesar en bloques definidos por perfil
@@ -473,15 +548,16 @@ async def _run_outreach_impl(
                 consecutive_actions_for_ip_rotation = 0
                 
                 # Pausa post-rotación
-                await asyncio.sleep(random.uniform(10, 20))
+                await _humanized_wait(10.0, 20.0, "post IP rotation pause")
 
             # 5. Navegar al perfil organico
             await page.goto(f"https://www.instagram.com/{username}/", wait_until="domcontentloaded")
-            await asyncio.sleep(random.uniform(3, 7))
+            await _humanized_wait(3.0, 7.0, f"profile settle @{username}")
 
             # Verificar Anti-Pattern al cargar perfil
             if await _check_anti_pattern(page, memory_log):
                 logger.error("Bloqueo detectado al cargar perfil. Abortando sesion.")
+                await _capture_outreach_evidence(page, "anti_pattern_block", "Instagram bloqueó la sesión", extra={"username": username})
                 blocked += 1
                 break
 
@@ -517,7 +593,7 @@ async def _run_outreach_impl(
 
             # 7. Click Mensaje
             try:
-                if not await _open_message_composer(page):
+                if not await _open_message_composer(page, username):
                     logger.warning(f"No se pudo encontrar el boton Mensaje para @{username}.")
                     db.update_status(username, "Error - No DM Button")
                     db.update_lead_after_message(username, "Error - No DM Button", result="sin_boton_dm", error_detail="No se encontró el botón Mensaje en el perfil.")
@@ -546,8 +622,9 @@ async def _run_outreach_impl(
                     continue
             except Exception as e:
                 logger.warning(f"Error buscando boton Mensaje para @{username}: {e}")
+                evidence = await _capture_outreach_evidence(page, "open_message_composer_exception", e, selector="message_button", extra={"username": username})
                 db.update_status(username, "Error - No DM Button")
-                db.update_lead_after_message(username, "Error - No DM Button", result="error_apertura_dm", error_detail=str(e))
+                db.update_lead_after_message(username, "Error - No DM Button", result="error_apertura_dm", error_detail=json.dumps(evidence, ensure_ascii=False))
                 no_dm_button += 1
                 errors += 1
                 processed_count += 1
@@ -578,18 +655,44 @@ async def _run_outreach_impl(
                 if not message_template:
                     logger.info(f"Lead @{username} ya no tiene un siguiente paso automático para enviar.")
                     continue
+
+                lead_id = int(lead.get("id") or 0)
+                reserve_checkpoint = f"reserved:{lead_id}:{username}" if lead_id > 0 else f"reserved:{username}"
+                _update_job_progress(i, len(leads), username, reserve_checkpoint)
+                if progress_hook:
+                    eta_min, eta_max = _estimate_eta_range(i, len(leads))
+                    await progress_hook({
+                        "status": "running",
+                        "progress": int((i / max(len(leads), 1)) * 100),
+                        "current_action": f"Reserva durable creada para @{username}",
+                        "current_lead": username,
+                        "processed": i,
+                        "total": len(leads),
+                        "eta_seconds": _estimate_eta_seconds(i, len(leads)),
+                        "eta_min_seconds": eta_min,
+                        "eta_max_seconds": eta_max,
+                        "metrics": {
+                            "sent": dms_sent_this_session,
+                            "errors": errors,
+                            "blocked": blocked,
+                            "no_dm_button": no_dm_button,
+                        },
+                        "checkpoint": reserve_checkpoint,
+                        "lead_id": lead_id,
+                        "drop_from_pending": bool(lead_id),
+                    })
                 
                 # El selector de input de dms (varía, este es genérico de contenteditable)
                 input_box = page.locator('div[role="textbox"]')
                 
                 # Espera suave (se superó el timeout estricto de visibilidad)
-                await asyncio.sleep(2)
+                await _humanized_wait(1.5, 3.0, f"textbox settle before typing @{username}")
                 
                 if not dry_run:
                     await type_like_human(page, 'div[role="textbox"]', message_template)
                     # Enviar (Intentos combinados: Tecla Enter + Click JS en el boton de envio)
                     await page.keyboard.press("Enter")
-                    await asyncio.sleep(1)
+                    await _humanized_wait(0.8, 1.8, f"post-enter settle @{username}")
                     
                     # Fallback click JS (A veces Instagram ignora 'Enter' y requiere click en el boton Enviar explicitamente)
                     await page.evaluate("""() => {
@@ -646,8 +749,9 @@ async def _run_outreach_impl(
             except Exception as e:
                 dm_send_success = False
                 logger.error(f"Error escribiendo DM a @{username}: {e}")
+                evidence = await _capture_outreach_evidence(page, "send_dm", e, selector='div[role="textbox"]', extra={"username": username})
                 db.update_status(username, "Error - Fallo envio")
-                db.update_lead_after_message(username, "Error - Fallo envio", result="error_envio", error_detail=str(e))
+                db.update_lead_after_message(username, "Error - Fallo envio", result="error_envio", error_detail=json.dumps(evidence, ensure_ascii=False))
                 errors += 1
                 processed_count += 1
                 if progress_hook:
@@ -680,7 +784,7 @@ async def _run_outreach_impl(
                         # Durante pausas largas aplicamos ruido para mantener la conexion viva
                         await add_behavior_noise(page, duration_seconds=(pause_min * 60))
                     else:
-                        await asyncio.sleep(pause_min)
+                        await _humanized_wait(float(pause_min), float(pause_min) + 0.9, "dry-run batch pause")
                 else:
                     # Delay normal entre DMs (Gaussiano en el rango definido en Account DNA)
                     delay_sec = random.uniform(delay_dm['min'], delay_dm['max'])
@@ -689,6 +793,7 @@ async def _run_outreach_impl(
 
     except Exception as e:
         logger.error(f"Falla critica en Orchestrator: {e}")
+        await _capture_outreach_evidence(page, "outreach_orchestrator", e)
         if progress_hook:
             await progress_hook({"status": "error", "progress": 0, "current_action": f"Falla critica: {e}"})
     finally:

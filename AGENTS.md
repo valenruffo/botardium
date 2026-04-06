@@ -57,6 +57,17 @@ El sub-agente revisor y el pre-commit hook DEBEN rechazar (FAIL) cualquier códi
 2. **Secretos:**
    - RECHAZAR cualquier string hardcodeado que parezca un token, contraseña, IP residencial o cookie. Todo debe pasar por `os.getenv()`.
 
+## Reglas por Sistema Operativo (OS)
+### Windows (Prioridad 1 - Verificado)
+- El entorno de ejecución principal es Windows.
+- El backend usa `WindowsProactorEventLoopPolicy`. Mantener esta compatibilidad.
+- Empaquetado: NSIS (.exe).
+
+### macOS (Best Effort - No Verificado)
+- No asumir paridad total con Windows.
+- Los paths y el naming del backend están acoplados a Windows. 
+- Cualquier cambio para macOS debe ser tratado como experimental y no debe romper el flujo de Windows.
+
 ## 📁 Estándares de Estructura de Archivos
 
 ```text

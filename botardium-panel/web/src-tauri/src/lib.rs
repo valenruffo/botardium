@@ -41,20 +41,24 @@ fn backend_health_response() -> Option<String> {
   Some(response)
 }
 
-fn backend_healthcheck() -> bool {
-  matches!(
-    backend_health_response().as_deref(),
-    Some(response) if response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
-  )
-}
-
-fn backend_version() -> Option<String> {
+fn backend_health_payload() -> Option<Value> {
   let response = backend_health_response()?;
   if !(response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")) {
     return None;
   }
   let body = response.split("\r\n\r\n").nth(1)?;
-  let payload: Value = serde_json::from_str(body).ok()?;
+  serde_json::from_str(body).ok()
+}
+
+fn backend_healthcheck() -> bool {
+  matches!(
+    backend_health_payload(),
+    Some(payload) if payload.get("ready").and_then(Value::as_bool) == Some(true)
+  )
+}
+
+fn backend_version() -> Option<String> {
+  let payload = backend_health_payload()?;
   payload.get("version")?.as_str().map(|value| value.to_string())
 }
 

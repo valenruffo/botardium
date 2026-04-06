@@ -108,6 +108,13 @@ class JobRuntime:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_workspace ON jobs(workspace_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs(idempotency_key)")
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_workspace_idempotency_unique
+                ON jobs(workspace_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL
+                """
+            )
             conn.commit()
 
     def _get_connection(self):
@@ -129,6 +136,11 @@ class JobRuntime:
     ) -> Optional[JobRecord]:
         now = datetime.now().isoformat()
 
+        existing_by_job_id = self.get_job(job_id)
+        if existing_by_job_id:
+            logger.info(f"Job {job_id} already exists, returning persisted record")
+            return existing_by_job_id
+
         if idempotency_key:
             existing = self.get_job_by_idempotency_key(idempotency_key, workspace_id)
             if existing:
@@ -137,11 +149,26 @@ class JobRuntime:
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO jobs (job_id, job_type, workspace_id, status, idempotency_key, payload, progress, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 0.0, ?)
-            """, (job_id, job_type, workspace_id, JobStatus.PENDING.value, idempotency_key, json.dumps(payload), now))
-            conn.commit()
+            try:
+                cursor.execute("""
+                    INSERT INTO jobs (job_id, job_type, workspace_id, status, idempotency_key, payload, progress, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 0.0, ?)
+                """, (job_id, job_type, workspace_id, JobStatus.PENDING.value, idempotency_key, json.dumps(payload), now))
+                conn.commit()
+            except sqlite3.IntegrityError:
+                logger.info(
+                    "Job creation raced with an existing persisted record for job_id=%s idempotency_key=%s",
+                    job_id,
+                    idempotency_key,
+                )
+                existing = self.get_job(job_id)
+                if existing:
+                    return existing
+                if idempotency_key:
+                    existing = self.get_job_by_idempotency_key(idempotency_key, workspace_id)
+                    if existing:
+                        return existing
+                raise
 
         logger.info(f"Created job {job_id} of type {job_type} for workspace {workspace_id}")
         return self.get_job(job_id)
