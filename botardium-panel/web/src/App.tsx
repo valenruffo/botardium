@@ -812,6 +812,7 @@ type UpdateStatus = {
   update_available?: boolean;
   download_url?: string;
   release_url?: string;
+  published_at?: string;
   notes?: string;
   detail?: string;
 };
@@ -821,6 +822,16 @@ type NativeUpdatePhase = 'idle' | 'checking' | 'available' | 'downloading' | 'in
 type NativeUpdateMeta = {
   version: string;
   notes?: string;
+};
+
+const formatReleaseDate = (value?: string) => {
+  if (!value) return 'Sin fecha publicada';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat('es-AR', {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(parsed);
 };
 
 export default function Dashboard() {
@@ -844,7 +855,11 @@ export default function Dashboard() {
   const [isSavingAiKeys, setIsSavingAiKeys] = useState(false);
   const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<NativeUpdatePhase>('idle');
-  const [updatePhaseMessage, setUpdatePhaseMessage] = useState('Listo para revisar updates.');
+  const [updatePhaseMessage, setUpdatePhaseMessage] = useState(() => (
+    isTauriDesktop()
+      ? 'Listo para revisar updates.'
+      : 'Mostrando metadata de releases de la app de escritorio.'
+  ));
   const [nativeUpdateMeta, setNativeUpdateMeta] = useState<NativeUpdateMeta | null>(null);
   const [nativeDownloadPercent, setNativeDownloadPercent] = useState<number | null>(null);
   const [isExportingWorkspace, setIsExportingWorkspace] = useState(false);
@@ -897,6 +912,7 @@ export default function Dashboard() {
   const [isEmergencyStopping, setIsEmergencyStopping] = useState(false);
   const [showJobHistory, setShowJobHistory] = useState(false);
   const [emergencyStopResult, setEmergencyStopResult] = useState<EmergencyStopResponse | null>(null);
+  const isDesktopRuntime = isTauriDesktop();
   const nativeUpdateRef = useRef<Awaited<ReturnType<typeof checkNativeUpdate>> | null>(null);
   const updateActionLockRef = useRef(false);
   const updaterProbeRanRef = useRef(false);
@@ -1057,6 +1073,8 @@ export default function Dashboard() {
   const messageJobs = messageJobsDataRaw.filter((job) => job.kind !== 'prepare');
   const activeMessageJobs = messageJobs.filter((job) => job.status === 'running' || job.status === 'queued' || job.status === 'paused');
   const historicalMessageJobs = messageJobs.filter((job) => !(job.status === 'running' || job.status === 'queued' || job.status === 'paused'));
+  const latestReleaseVersion = nativeUpdateMeta?.version || updateStatus?.latest_version || updateStatus?.current_version || __APP_VERSION__;
+  const releasePublishedLabel = formatReleaseDate(updateStatus?.published_at);
   const visibleMessageJobs = (showJobHistory ? messageJobs : activeMessageJobs).slice(0, 4);
   const activeCampaigns: ActiveCampaign[] = (botStatus?.campaigns || []).map((campaign) => ({
     id: campaign.id,
@@ -2831,37 +2849,71 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="border-t border-slate-800 pt-4">
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
-                <div className="flex items-center justify-between gap-3">
-                  <span>Botardium {__APP_VERSION__}</span>
-                  {nativeUpdateMeta?.version || updateStatus?.update_available ? <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">update</span> : null}
-                </div>
-                <div className="mt-3 space-y-2">
-                  <button onClick={() => { void checkForUpdates(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50">
-                    <span>{isCheckingUpdates || updatePhase === 'checking' ? 'Buscando update...' : 'Buscar actualización'}</span>
-                    <Sparkles className="h-3.5 w-3.5" />
-                  </button>
-                  {nativeUpdateMeta?.version || updateStatus?.update_available ? (
-                    <button onClick={() => { void installNativeUpdate(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-left text-emerald-200 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-50">
-                      <span>
-                        {updatePhase === 'downloading'
-                          ? `Descargando ${nativeDownloadPercent ? `${nativeDownloadPercent}%` : '...'}`
-                          : updatePhase === 'installing'
-                            ? 'Instalando update...'
-                            : nativeUpdateMeta?.version
-                              ? `Actualizar ahora (in-app) a ${nativeUpdateMeta.version}`
-                              : `Descargar instalador ${updateStatus?.latest_version ? `(${updateStatus.latest_version})` : ''}`}
-                      </span>
-                      <KeyRound className="h-3.5 w-3.5" />
-                    </button>
-                  ) : null}
-                  <div className="rounded-xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 text-[11px] leading-relaxed text-slate-400">
-                    {updatePhaseMessage}
-                    {updatePhase === 'fallback' ? <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-300">modo compatibilidad</span> : null}
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400">
+                  <div className="flex items-center justify-between gap-3">
+                  <span>{isDesktopRuntime ? `Botardium ${__APP_VERSION__}` : 'Releases de Botardium Desktop'}</span>
+                  {isDesktopRuntime && (nativeUpdateMeta?.version || updateStatus?.update_available) ? <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-emerald-300">update</span> : null}
                   </div>
+                  {isDesktopRuntime ? (
+                    <div className="mt-3 space-y-2">
+                      <button onClick={() => { void checkForUpdates(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50">
+                        <span>{isCheckingUpdates || updatePhase === 'checking' ? 'Buscando update...' : 'Buscar actualización'}</span>
+                        <Sparkles className="h-3.5 w-3.5" />
+                      </button>
+                      {nativeUpdateMeta?.version || updateStatus?.update_available ? (
+                        <button onClick={() => { void installNativeUpdate(); }} disabled={isCheckingUpdates || updatePhase === 'downloading' || updatePhase === 'installing'} className="flex w-full items-center justify-between rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-left text-emerald-200 hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:opacity-50">
+                          <span>
+                            {updatePhase === 'downloading'
+                              ? `Descargando ${nativeDownloadPercent ? `${nativeDownloadPercent}%` : '...'}`
+                              : updatePhase === 'installing'
+                                ? 'Instalando update...'
+                                : nativeUpdateMeta?.version
+                                  ? `Actualizar ahora (in-app) a ${nativeUpdateMeta.version}`
+                                  : `Descargar instalador ${updateStatus?.latest_version ? `(${updateStatus.latest_version})` : ''}`}
+                          </span>
+                          <KeyRound className="h-3.5 w-3.5" />
+                        </button>
+                      ) : null}
+                      <div className="rounded-xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 text-[11px] leading-relaxed text-slate-400">
+                        {updatePhaseMessage}
+                        {updatePhase === 'fallback' ? <span className="ml-2 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-amber-300">modo compatibilidad</span> : null}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-3 space-y-1.5">
+                      <div className="rounded-xl border border-slate-800/80 bg-slate-900/70 px-3 py-2 text-[11px]">
+                        <div className="flex items-center justify-between gap-3 py-1">
+                          <span className="text-slate-500">Sesión web</span>
+                          <span className="font-medium text-slate-200">{__APP_VERSION__}</span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 py-1">
+                          <span className="text-slate-500">Release publicada</span>
+                          <span className="font-medium text-slate-200">{latestReleaseVersion}</span>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 py-1">
+                          <span className="text-slate-500">Publicada</span>
+                          <span className="text-right font-medium text-slate-200">{releasePublishedLabel}</span>
+                        </div>
+                      </div>
+                      <div className="flex gap-2">
+                        <button onClick={() => { void checkForUpdates(); }} disabled={isCheckingUpdates} className="flex min-w-0 flex-1 items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50">
+                          <span className="truncate">{isCheckingUpdates ? 'Consultando...' : 'Actualizar info'}</span>
+                          <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                        </button>
+                        {updateStatus?.release_url ? (
+                          <a href={updateStatus.release_url} target="_blank" rel="noreferrer" className="flex min-w-0 flex-1 items-center justify-between rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-left text-slate-200 hover:border-cyan-500 hover:text-cyan-200">
+                            <span className="truncate">Ver release</span>
+                            <Info className="h-3.5 w-3.5 shrink-0" />
+                          </a>
+                        ) : null}
+                      </div>
+                      <div className="px-1 text-[11px] text-slate-500">
+                        {isCheckingUpdates ? 'Consultando releases...' : updatePhaseMessage}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
-            </div>
           </div>
         </aside>
 

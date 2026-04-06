@@ -40,11 +40,8 @@ test('browser runtime uses fallback available state', () => {
   });
 
   assert.equal(resolution.phase, 'fallback');
-  assert.equal(resolution.message, 'Modo compatibilidad activo: update manual disponible.');
-  assert.deepEqual(resolution.toast, {
-    level: 'success',
-    message: 'Hay una actualización disponible: 1.2.0.',
-  });
+  assert.equal(resolution.message, 'Release disponible: 1.2.0. En navegador solo mostramos información.');
+  assert.equal(resolution.toast, null);
 });
 
 test('browser runtime uses fallback no_update state', () => {
@@ -59,7 +56,7 @@ test('browser runtime uses fallback no_update state', () => {
   });
 
   assert.equal(resolution.phase, 'no_update');
-  assert.equal(resolution.message, 'Ya estás en la última versión (1.1.0).');
+  assert.equal(resolution.message, 'Info de releases al día. Esta sesión web corre la versión 1.1.0.');
 });
 
 test('desktop native failure falls back to manual update when fallback reports update', () => {

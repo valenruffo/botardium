@@ -56,6 +56,38 @@ const buildErrorResolution = (message) => ({
 });
 
 /**
+ * @param {{ appVersion: string; fallbackStatus?: UpdateStatus | null }} input
+ * @returns {UpdateCheckResolution}
+ */
+const resolveBrowserReleaseStatus = ({ appVersion, fallbackStatus }) => {
+  if (!fallbackStatus?.ok) {
+    return buildErrorResolution(
+      fallbackStatus?.detail || 'No pude consultar información de releases.',
+    );
+  }
+
+  const latestVersion = fallbackStatus.latest_version || fallbackStatus.current_version || appVersion;
+
+  return {
+    phase: fallbackStatus.update_available ? 'fallback' : 'no_update',
+    message: fallbackStatus.update_available
+      ? `Release publicada detectada: ${latestVersion}.`
+      : 'Metadata de releases actualizada.',
+    nativeUpdateMeta: null,
+    keepNativeUpdate: false,
+    toast: null,
+    log: {
+      level: 'info',
+      event: 'browser_release_info',
+      payload: {
+        latest_version: latestVersion,
+        update_available: Boolean(fallbackStatus.update_available),
+      },
+    },
+  };
+};
+
+/**
  * @param {{
  *   runtime: 'browser' | 'desktop_error';
  *   appVersion: string;
@@ -168,5 +200,5 @@ export const resolveUpdateCheckState = ({
     };
   }
 
-  return resolveFallbackStatus({ runtime: 'browser', appVersion, fallbackStatus });
+  return resolveBrowserReleaseStatus({ appVersion, fallbackStatus });
 };

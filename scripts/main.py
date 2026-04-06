@@ -675,6 +675,7 @@ def _latest_release_status(current_version: str) -> Dict[str, Any]:
         "update_available": _version_tuple(latest_version) > current,
         "download_url": installer.get("browser_download_url") if installer else payload.get("html_url"),
         "release_url": payload.get("html_url"),
+        "published_at": payload.get("published_at"),
         "notes": str(payload.get("body") or "")[:1200],
     }
 
