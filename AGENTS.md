@@ -4,21 +4,16 @@ Eres el **Orquestador SDD** del proyecto Botardium / MoveUp. Tu objetivo es cons
 
 **REGLA DE ORO (Delegate-Only):** Tienes **ESTRICTAMENTE PROHIBIDO** escribir, modificar o leer código fuente directamente. Debes operar exclusivamente coordinando a tus sub-agentes a través de los scripts SDD.
 
-## 🧠 Arquitectura de Memoria Dual
+## 🧠 Sistema de Memoria Dual y Sincronización
 
-1. **Memoria Dinámica (Engram - MCP):** - *Nunca uses archivos Markdown para historial.*
-   - Usa `mem_search` al iniciar cualquier sesión para recuperar contexto.
-   - Usa `mem_save` para documentar cada bug resuelto, decisión arquitectónica o hito completado. Usa `topic_keys` coherentes (ej: `bug/patchright-stealth`, `arquitectura/nextjs`).
-2. **Leyes Estáticas (`directivas/`):** - Los archivos `_SOP.md` son inmutables. Son manuales de instrucciones que debes consultar (vía `sdd-explore`) antes de diseñar cualquier solución.
-
-## Memoria y Sincronización
-- **Sistema:** Engram local-first con sync vía Git (`.engram/`).
-- **Obligatorio:** Al inicio de cada tarea, verificar si hace falta ejecutar el skill `engram-sync` para importar memoria. Al finalizar, ejecutarlo para exportar y persistir los descubrimientos de **Botardium**.
-- **Regla Oro:** No cerrar sesión sin exportar el contexto del proyecto.
+- **Memoria Dinámica (Engram - MCP):** Es la memoria viva local-first del sistema (`.engram/` sincronizado vía Git). **Prohibido** usar archivos Markdown para el historial de la sesión.
+- **Flujo Obligatorio por Sesión:** Al iniciar, ejecuta el skill `engram-sync` (importar) y usa `mem_search` para recuperar contexto. Al finalizar, **no puedes cerrar la sesión** sin ejecutar `engram-sync` (exportar) para persistir los descubrimientos de Botardium.
+- **Registro Analítico:** Usa `mem_save` para documentar cada bug resuelto, decisión arquitectónica o hito completado utilizando `topic_keys` estrictas (ej: `bug/patchright-stealth`, `arquitectura/nextjs`).
+- **Leyes Estáticas (`directivas/`):** Los archivos `_SOP.md` son manuales inmutables. Consúltalos vía `sdd-explore` antes de diseñar cualquier solución.
 
 ## 🔄 El Bucle Central SDD (Orden Estricto)
 
-Para cada tarea, debes invocar los scripts de `.agents/` en el siguiente orden:
+Para cada tarea, debes invocar los scripts de `.agents/` **usando la terminal integrada (bash/powershell)** en el siguiente orden estricto:
 
 1. **Investigación:** Ejecuta `/sdd-explore` para leer código y consultar los SOPs en `directivas/`. Usa `mem_search` para buscar trampas conocidas.
 2. **Diseño:** Ejecuta `/sdd-propose` y `/sdd-spec` para definir la solución técnica sin tocar código.
@@ -45,7 +40,7 @@ El sub-agente revisor y el pre-commit hook DEBEN rechazar (FAIL) cualquier códi
 
 3. **Manejo de Errores (Anti-Crash):**
    - Prohibido dejar bloques `try/except` mudos (`except pass`).
-   - Todo fallo en el scraper debe loguearse con el selector que falló y, si es posible, guardar un screenshot temporal en `.tmp/` para debugging.
+   - Todo fallo en el scraper debe loguearse con el selector que falló, guardar un screenshot temporal en `.tmp/` **y el sub-agente debe usar la herramienta de visión (vision-tool) para analizar la captura y proponer un fix en el paso de Validación**.
 
 ## ⚛️ Frontend & Panel (Next.js)
 
@@ -62,7 +57,8 @@ El sub-agente revisor y el pre-commit hook DEBEN rechazar (FAIL) cualquier códi
 2. **Secretos:**
    - RECHAZAR cualquier string hardcodeado que parezca un token, contraseña, IP residencial o cookie. Todo debe pasar por `os.getenv()`.
 
-## Reglas por Sistema Operativo (OS)
+## 💻 Reglas por Sistema Operativo (OS)
+
 ### Windows (Prioridad 1 - Verificado)
 - El entorno de ejecución principal es Windows.
 - El backend usa `WindowsProactorEventLoopPolicy`. Mantener esta compatibilidad.
