@@ -81,13 +81,13 @@ class Phase7RolloutSafeguardsTests(unittest.TestCase):
              patch.object(main, "init_db"), \
              patch.object(main, "_connect_db") as connect_db, \
              patch.object(main, "migrate_legacy_workspace_ai_secrets"), \
+             patch.object(main, "migrate_runtime_ai_store_to_google_only"), \
              patch.object(main, "_ensure_leads_workspace_safe_schema"), \
              patch.object(main, "_load_persisted_runtime_state"), \
              patch.object(main, "_recover_durable_outreach_jobs") as recover_outreach, \
              patch.object(main, "_recover_durable_campaign_jobs") as recover_campaigns, \
              patch.object(main, "cleanup_legacy_message_previews"), \
-             patch.object(main, "load_bootstrap_env"), \
-             patch("scripts.main.openai"):
+             patch.object(main, "load_bootstrap_env"):
             connect_db.return_value = type("Conn", (), {"commit": lambda self: None, "close": lambda self: None})()
             main.startup_event()
 

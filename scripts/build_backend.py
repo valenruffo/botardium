@@ -71,7 +71,6 @@ def main():
         "--hidden-import", "uvicorn",
         "--hidden-import", "fastapi",
         "--hidden-import", "pydantic",
-        "--hidden-import", "openai",
         "--hidden-import", "sqlite3",
         "--hidden-import", "scripts.core_warmer",
         "--hidden-import", "scripts.lead_scraper",

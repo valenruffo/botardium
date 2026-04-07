@@ -99,7 +99,7 @@ To assign different models per phase, edit `~/.config/opencode/opencode.json` an
     "sdd-spec":         { "mode": "subagent", "model": "anthropic/claude-opus-4-6" },
     "sdd-design":       { "mode": "subagent", "model": "anthropic/claude-opus-4-6" },
     "sdd-apply":        { "mode": "subagent", "model": "anthropic/claude-sonnet-4-6" },
-    "sdd-verify":       { "mode": "subagent", "model": "openai/o3" }
+    "sdd-verify":       { "mode": "subagent", "model": "google/gemini-2.5-pro" }
   }
 }
 ```

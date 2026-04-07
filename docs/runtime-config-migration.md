@@ -4,7 +4,7 @@ Phase 1 moves reusable secrets out of tracked config and workspace exports.
 
 - Workspace AI keys now live in `config/runtime_secrets.json` under the writable runtime root.
 - In local dev that file resolves inside the repo, so `.gitignore` explicitly excludes it from accidental commits.
-- `scripts/main.py` migrates legacy `users.google_api_key` and `users.openai_api_key` values into that runtime file on startup, then clears the database columns.
+- `scripts/main.py` migrates legacy `users.google_api_key` values into that runtime file on startup, clears the legacy database columns, and strips any stored OpenAI runtime key during the Gemini-only migration.
 - `opencode.json` now reads MCP credentials from environment variables via `{env:...}` placeholders.
 - Workspace exports omit AI keys, Instagram passwords, and session material by default.
 - Legacy ZIP archives that still contain keys, passwords, cookies, or `sessions/` content are rejected during import.

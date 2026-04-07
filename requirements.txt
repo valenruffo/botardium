@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 pydantic
-openai
 patchright
 requests
 bcrypt

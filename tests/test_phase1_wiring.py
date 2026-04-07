@@ -59,7 +59,26 @@ class Phase1WiringTests(unittest.TestCase):
             self.assertEqual(row[0], "")
             self.assertEqual(row[1], "")
             self.assertEqual(resolved["google_api_key"], "g-legacy")
-            self.assertEqual(resolved["openai_api_key"], "o-legacy")
+            self.assertEqual(resolved, {"google_api_key": "g-legacy"})
+
+    def test_workspace_ai_status_only_enables_ai_with_google_key(self):
+        with patch.object(main, "_workspace_ai_config", return_value={"google_api_key": ""}):
+            disabled = main._workspace_ai_status(1)
+
+        self.assertFalse(disabled["google_configured"])
+        self.assertFalse(disabled["magic_box_enabled"])
+        self.assertFalse(disabled["message_studio_enabled"])
+        self.assertFalse(disabled["lead_drafts_enabled"])
+        self.assertIsNone(disabled["recommended_provider"])
+
+        with patch.object(main, "_workspace_ai_config", return_value={"google_api_key": "g-key"}):
+            enabled = main._workspace_ai_status(1)
+
+        self.assertTrue(enabled["google_configured"])
+        self.assertTrue(enabled["magic_box_enabled"])
+        self.assertTrue(enabled["message_studio_enabled"])
+        self.assertTrue(enabled["lead_drafts_enabled"])
+        self.assertEqual(enabled["recommended_provider"], "google")
 
     def test_export_route_omits_credentials_and_writes_notice(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

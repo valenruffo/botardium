@@ -7,15 +7,14 @@ Dejar explicito que modelo se usa en cada funcionalidad para optimizar costo sin
 ## Routing actual
 
 - `MagicBox / Strategy`:
-  - Proveedor principal: OpenAI
-  - Modelo recomendado: `gpt-4o-mini`
-  - Motivo: salida JSON estricta y estable.
+  - Proveedor principal: Google Gemini
+  - Modelo requerido: `gemini-3-flash`
+  - Fallback: inferencia local segura si Gemini falla.
 
 - `Message Studio / borradores de outreach`:
   - Proveedor principal: Google Gemini
   - Modelo requerido: `gemini-3-flash`
-  - Fallback 1: OpenAI (`gpt-4o-mini` o `OPENAI_MESSAGE_MODEL`)
-  - Fallback 2: generador local seguro
+  - Fallback: generador local seguro
 
 - `Filtro inteligente de nicho en scraping`:
   - Base: reglas locales + contexto de intent de MagicBox
@@ -24,12 +23,10 @@ Dejar explicito que modelo se usa en cada funcionalidad para optimizar costo sin
 
 ## Variables de entorno relevantes
 
-- `OPENAI_API_KEY`
 - `GOOGLE_API_KEY`
 - `GOOGLE_FLASH_MODEL=gemini-3-flash`
-- `OPENAI_MESSAGE_MODEL=gpt-4o-mini`
 
 ## Regla
 
-- No mover `MagicBox` fuera de OpenAI sin validar antes la estabilidad del JSON.
-- Priorizar Gemini en tareas frecuentes/baratas de copy o clasificacion.
+- `MagicBox` y `Message Studio` deben mantener una sola fuente LLM en runtime: Gemini.
+- Si Gemini no responde o devuelve salida invalida, caer a fallback local seguro.

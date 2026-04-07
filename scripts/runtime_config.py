@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from scripts.runtime_paths import ENV_EXAMPLE_PATH, ENV_PATH, RUNTIME_SECRETS_PATH
 
-AI_SECRET_FIELDS = ("google_api_key", "openai_api_key")
+AI_SECRET_FIELDS = ("google_api_key",)
 SENSITIVE_FIELD_CLASSES = {
     "google_api_key": "ai_keys",
     "openai_api_key": "ai_keys",
@@ -42,7 +42,6 @@ def load_bootstrap_env() -> Path:
 def get_bootstrap_ai_config() -> Dict[str, str]:
     return {
         "google_api_key": str(os.getenv("GOOGLE_API_KEY", "") or "").strip(),
-        "openai_api_key": str(os.getenv("OPENAI_API_KEY", "") or "").strip(),
     }
 
 
@@ -103,28 +102,45 @@ def get_workspace_ai_config(workspace_id: int | None, legacy_fallback: Mapping[s
             or bootstrap["google_api_key"]
             or ""
         ).strip(),
-        "openai_api_key": str(
-            workspace_config.get("openai_api_key")
-            or legacy.get("openai_api_key")
-            or bootstrap["openai_api_key"]
-            or ""
-        ).strip(),
     }
 
 
-def save_workspace_ai_config(workspace_id: int, google_api_key: str = "", openai_api_key: str = "") -> Dict[str, str]:
+def save_workspace_ai_config(workspace_id: int, google_api_key: str = "") -> Dict[str, str]:
     store = _runtime_secret_store()
     workspaces = store.setdefault("workspaces", {})
     payload = {
         "google_api_key": str(google_api_key or "").strip(),
-        "openai_api_key": str(openai_api_key or "").strip(),
     }
-    if payload["google_api_key"] or payload["openai_api_key"]:
+    if payload["google_api_key"]:
         workspaces[str(int(workspace_id))] = payload
     else:
         workspaces.pop(str(int(workspace_id)), None)
     _write_runtime_secret_store(store)
     return payload
+
+
+def migrate_runtime_ai_store_to_google_only() -> int:
+    store = _runtime_secret_store()
+    workspaces = store.get("workspaces") or {}
+    if not isinstance(workspaces, dict):
+        return 0
+
+    migrated = 0
+    sanitized_workspaces: Dict[str, Dict[str, str]] = {}
+    for workspace_id, raw_config in workspaces.items():
+        config = raw_config if isinstance(raw_config, Mapping) else {}
+        google_api_key = str(config.get("google_api_key") or "").strip()
+        had_openai = bool(str(config.get("openai_api_key") or "").strip())
+        had_extra_fields = any(str(key) != "google_api_key" for key in config.keys())
+        if had_openai or had_extra_fields:
+            migrated += 1
+        if google_api_key:
+            sanitized_workspaces[str(workspace_id)] = {"google_api_key": google_api_key}
+
+    if migrated:
+        store["workspaces"] = sanitized_workspaces
+        _write_runtime_secret_store(store)
+    return migrated
 
 
 def clear_legacy_workspace_ai_secrets(conn: Any, workspace_id: int) -> None:
@@ -160,13 +176,10 @@ def migrate_legacy_workspace_ai_secrets(conn: Any) -> int:
         workspace_id = str(int(row[0]))
         existing = dict(workspaces.get(workspace_id) or {})
         google_api_key = str(row[1] or "").strip()
-        openai_api_key = str(row[2] or "").strip()
         if google_api_key and not existing.get("google_api_key"):
             existing["google_api_key"] = google_api_key
-        if openai_api_key and not existing.get("openai_api_key"):
-            existing["openai_api_key"] = openai_api_key
         if existing:
-            workspaces[workspace_id] = existing
+            workspaces[workspace_id] = {"google_api_key": str(existing.get("google_api_key") or "").strip()}
         cursor.execute(
             "UPDATE users SET google_api_key = '', openai_api_key = '' WHERE id = ?",
             (int(workspace_id),),

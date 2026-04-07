@@ -794,15 +794,12 @@ function WorkspaceDeleteButton({ workspaceId, workspaceName, onDeleted, disabled
 
 type AiSettingsStatus = {
   google_api_key: string;
-  openai_api_key: string;
   google_configured: boolean;
-  openai_configured: boolean;
   magic_box_enabled: boolean;
   message_studio_enabled: boolean;
   lead_drafts_enabled: boolean;
-  recommended_provider?: 'google' | 'openai' | null;
+  recommended_provider?: 'google' | null;
   google_label: string;
-  openai_label: string;
 };
 
 type UpdateStatus = {
@@ -851,7 +848,6 @@ export default function Dashboard() {
   const [registerFullName, setRegisterFullName] = useState("");
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [googleApiKeyInput, setGoogleApiKeyInput] = useState("");
-  const [openAiApiKeyInput, setOpenAiApiKeyInput] = useState("");
   const [isSavingAiKeys, setIsSavingAiKeys] = useState(false);
   const [isCheckingUpdates, setIsCheckingUpdates] = useState(false);
   const [updatePhase, setUpdatePhase] = useState<NativeUpdatePhase>('idle');
@@ -1223,7 +1219,6 @@ export default function Dashboard() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           google_api_key: googleApiKeyInput,
-          openai_api_key: openAiApiKeyInput,
         }),
       });
       const data = await res.json();
@@ -1233,8 +1228,7 @@ export default function Dashboard() {
       }
       await mutateAiSettings();
       setGoogleApiKeyInput('');
-      setOpenAiApiKeyInput('');
-      toast.success('API keys guardadas para este workspace.');
+      toast.success('Google API Key guardada para este workspace.');
     } catch {
       toast.error('Error guardando las API keys.');
     } finally {
@@ -1766,7 +1760,6 @@ export default function Dashboard() {
 
   useEffect(() => {
     setGoogleApiKeyInput('');
-    setOpenAiApiKeyInput('');
   }, [currentUserId]);
 
   // Sonner Hook on new leads
@@ -4226,8 +4219,8 @@ export default function Dashboard() {
                 <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
                   <div className="max-w-2xl">
                     <p className="text-xs font-semibold uppercase tracking-[0.25em] text-cyan-300">API Keys</p>
-                    <h2 className="mt-3 text-3xl font-bold tracking-tight text-slate-100">Activa las funciones con IA por workspace</h2>
-                    <p className="mt-3 text-sm leading-relaxed text-slate-300">Botardium funciona manualmente sin IA. Si quieres Magic Box, borradores automáticos y regeneración inteligente, guarda aquí tus claves. La opción recomendada para empezar es <span className="font-semibold text-cyan-200">Google AI Studio</span>, que puede usarse gratis en muchos casos.</p>
+                    <h2 className="mt-3 text-3xl font-bold tracking-tight text-slate-100">Activa Gemini por workspace</h2>
+                    <p className="mt-3 text-sm leading-relaxed text-slate-300">Botardium funciona manualmente sin IA. Si quieres Magic Box, borradores automáticos y regeneración inteligente, guarda acá tu <span className="font-semibold text-cyan-200">Google API Key</span>. El runtime usa Gemini y conserva fallback local seguro cuando haga falta.</p>
                   </div>
                   <div className="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-4 py-3 text-xs text-cyan-100">
                     Las claves quedan asociadas a <span className="font-semibold">{currentUserEmail || 'este workspace'}</span> en esta computadora.
@@ -4237,32 +4230,22 @@ export default function Dashboard() {
 
               <div className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
                 <div className="rounded-3xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
-                  <h3 className="text-lg font-semibold text-slate-100">Proveedores disponibles</h3>
+                  <h3 className="text-lg font-semibold text-slate-100">Proveedor disponible</h3>
                   <div className="mt-5 space-y-4">
                     <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
                       <div className="flex items-start justify-between gap-4">
                         <div>
                           <p className="font-semibold text-slate-100">Google AI Studio</p>
-                          <p className="mt-1 text-sm text-slate-400">Ideal para empezar sin costo alto. Botardium la usa para Magic Box y Message Studio cuando está disponible.</p>
+                          <p className="mt-1 text-sm text-slate-400">Botardium usa Gemini para Magic Box y Message Studio. Si Gemini falla, el producto cae a sus fallbacks locales ya existentes.</p>
                         </div>
                         <Badge variant="outline" className={aiSettings?.google_configured ? 'border-emerald-500/30 text-emerald-300' : 'border-rose-500/30 text-rose-300'}>{aiSettings?.google_configured ? 'Conectada' : 'Falta key'}</Badge>
                       </div>
                       <input value={googleApiKeyInput} onChange={(e) => setGoogleApiKeyInput(e.target.value)} placeholder={aiSettings?.google_api_key ? `Actual: ${aiSettings.google_api_key}` : 'Pega tu GOOGLE_API_KEY'} className="mt-4 w-full rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-slate-100 outline-none focus:border-cyan-500" />
                     </div>
-                    <div className="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
-                      <div className="flex items-start justify-between gap-4">
-                        <div>
-                          <p className="font-semibold text-slate-100">OpenAI</p>
-                          <p className="mt-1 text-sm text-slate-400">Opcional. Puede servirte como respaldo o para mantener la calidad del flujo IA si ya tienes crédito allí.</p>
-                        </div>
-                        <Badge variant="outline" className={aiSettings?.openai_configured ? 'border-emerald-500/30 text-emerald-300' : 'border-slate-700 text-slate-400'}>{aiSettings?.openai_configured ? 'Conectada' : 'Opcional'}</Badge>
-                      </div>
-                      <input value={openAiApiKeyInput} onChange={(e) => setOpenAiApiKeyInput(e.target.value)} placeholder={aiSettings?.openai_api_key ? `Actual: ${aiSettings.openai_api_key}` : 'Pega tu OPENAI_API_KEY'} className="mt-4 w-full rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm text-slate-100 outline-none focus:border-cyan-500" />
-                    </div>
                   </div>
                   <div className="mt-5 flex flex-wrap gap-3">
-                    <button onClick={saveAiKeys} disabled={isSavingAiKeys} className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">{isSavingAiKeys ? 'Guardando...' : 'Guardar API Keys'}</button>
-                    <button onClick={() => { setGoogleApiKeyInput(''); setOpenAiApiKeyInput(''); }} className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">Limpiar formulario</button>
+                    <button onClick={saveAiKeys} disabled={isSavingAiKeys} className="rounded-xl bg-cyan-600 px-4 py-2 text-sm font-semibold text-white hover:bg-cyan-500 disabled:opacity-50">{isSavingAiKeys ? 'Guardando...' : 'Guardar Google API Key'}</button>
+                    <button onClick={() => { setGoogleApiKeyInput(''); }} className="rounded-xl bg-slate-800 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">Limpiar formulario</button>
                   </div>
                 </div>
 

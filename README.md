@@ -33,7 +33,7 @@ SQLite + archivos runtime + sesiones + side effects locales
         |
         +--> Patchright / stealth engine / scraping
         +--> ADB / utilidades auxiliares
-        +--> OpenAI / Google GenAI para funciones de IA
+        +--> Google GenAI + fallbacks locales para funciones de IA
 
 Tauri Desktop
         |
@@ -84,7 +84,6 @@ Piezas clave verificadas:
 | Uvicorn | usado, sin pin | `requirements.txt` |
 | Pydantic | usado, sin pin | `requirements.txt` |
 | Patchright | usado, sin pin | `requirements.txt` |
-| OpenAI SDK | usado, sin pin | `requirements.txt` + `scripts/main.py` |
 | Google GenAI | usado, sin pin | `requirements.txt` + `scripts/main.py` |
 | SQLite | runtime principal | `scripts/main.py` |
 | bcrypt / pyjwt | auth local | `requirements.txt` |

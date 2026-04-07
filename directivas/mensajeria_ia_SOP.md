@@ -6,7 +6,7 @@ Generar mensajes de primer contacto y follow-up usando LLM real, evitando planti
 
 ## Reglas duras
 
-- El mensaje final debe salir de un modelo LLM real cuando `OPENAI_API_KEY` este disponible.
+- El mensaje final debe salir de Gemini cuando `GOOGLE_API_KEY` este disponible.
 - Nunca concatenar el prompt del operador debajo de un template fijo como si fuera el mensaje final.
 - Nunca mencionar en el copy final:
   - hashtags

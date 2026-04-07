@@ -21,7 +21,6 @@ import re
 import sqlite3
 import time
 import subprocess
-import openai
 import json
 import asyncio
 import sys
@@ -55,6 +54,7 @@ from scripts.runtime_config import (
     get_workspace_ai_config as get_runtime_workspace_ai_config,
     load_bootstrap_env,
     migrate_legacy_workspace_ai_secrets,
+    migrate_runtime_ai_store_to_google_only,
     redact_secret,
     sanitize_workspace_export_payload,
     save_workspace_ai_config,
@@ -403,14 +403,13 @@ def _workspace_ai_config(workspace_id: Optional[int]) -> Dict[str, str]:
     conn = _connect_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT google_api_key, openai_api_key FROM users WHERE id = ?",
+        "SELECT google_api_key FROM users WHERE id = ?",
         (int(workspace_id),),
     )
     row = cursor.fetchone()
     conn.close()
     legacy = {
         "google_api_key": str(row["google_api_key"] or "").strip() if row else "",
-        "openai_api_key": str(row["openai_api_key"] or "").strip() if row else "",
     }
     return get_runtime_workspace_ai_config(workspace_id, legacy)
 
@@ -418,16 +417,13 @@ def _workspace_ai_config(workspace_id: Optional[int]) -> Dict[str, str]:
 def _workspace_ai_status(workspace_id: Optional[int]) -> Dict[str, Any]:
     config = _workspace_ai_config(workspace_id)
     has_google = bool(config["google_api_key"])
-    has_openai = bool(config["openai_api_key"])
     return {
         "google_configured": has_google,
-        "openai_configured": has_openai,
-        "magic_box_enabled": has_google or has_openai,
-        "message_studio_enabled": has_google or has_openai,
-        "lead_drafts_enabled": has_google or has_openai,
-        "recommended_provider": "google" if has_google else ("openai" if has_openai else None),
+        "magic_box_enabled": has_google,
+        "message_studio_enabled": has_google,
+        "lead_drafts_enabled": has_google,
+        "recommended_provider": "google" if has_google else None,
         "google_label": "Google AI Studio (gratis para empezar)",
-        "openai_label": "OpenAI",
     }
 
 
@@ -989,8 +985,7 @@ def startup_event():
         cleanup_legacy_message_previews()
 
         load_bootstrap_env()
-        openai.api_key = os.getenv("OPENAI_API_KEY")
-        GOOGLE_API_KEY = get_bootstrap_ai_config()["google_api_key"]
+        migrate_runtime_ai_store_to_google_only()
     except Exception as exc:
         _set_startup_state(completed=False, error=f"{type(exc).__name__}: {exc}")
         raise
@@ -1006,7 +1001,6 @@ class MagicBoxRequest(BaseModel):
 
 class WorkspaceAiSettingsRequest(BaseModel):
     google_api_key: str = ""
-    openai_api_key: str = ""
 
 
 class WorkspaceImportRequest(BaseModel):
@@ -2748,7 +2742,6 @@ def _generate_gemini_message_bundle(system_prompt: str, user_payload: Dict[str, 
 def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_prompt: str, workspace_id: Optional[int] = None) -> Dict[str, Any]:
     ai_config = _workspace_ai_config(workspace_id)
     google_api_key = ai_config["google_api_key"]
-    openai_api_key = ai_config["openai_api_key"]
     context = _build_lead_context_for_llm(lead)
     fallback_message = _generate_personalized_message(lead, stage_prompt)
     fallback_bundle = {
@@ -2804,41 +2797,7 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
                     "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
                 }
 
-    if not openai_api_key:
-        return fallback_bundle
-
-    try:
-        client = openai.OpenAI(api_key=openai_api_key)
-        response = client.chat.completions.create(
-            model=os.getenv("OPENAI_MESSAGE_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.8,
-        )
-        content = response.choices[0].message.content or "{}"
-        data = json.loads(content)
-        message = _sanitize_message_output(str(data.get("message") or "").strip())
-        rationale = str(data.get("rationale") or "").strip()
-        variant = str(data.get("variant") or context["variant"]).strip()
-        if not message or len(message) < 35:
-            return fallback_bundle
-        issues = _validate_message_quality(message)
-        if issues:
-            fallback_bundle["rationale"] = f"Fallback seguro por calidad: {', '.join(issues)}"
-            return fallback_bundle
-        if variant not in {"first_contact", "follow_up_1", "follow_up_2"}:
-            variant = context["variant"]
-        return {
-            "message": message,
-            "rationale": rationale or "Mensaje generado por IA con tono humano y CTA suave.",
-            "variant": variant,
-            "provider": os.getenv("OPENAI_MESSAGE_MODEL", "gpt-4o-mini"),
-        }
-    except Exception:
-        return fallback_bundle
+    return fallback_bundle
 
 
 def _bundle_for_lead_with_payload(lead: Dict[str, Any], payload: MessageStudioRequest | LeadRegenerateDraftRequest) -> Dict[str, Any]:
@@ -3779,7 +3738,7 @@ async def delete_account(account_id: int, request: Request):
 async def generate_strategy(payload: MagicBoxRequest, request: Request):
     """
     Magic Box Brain: Procesa un input de lenguaje natural 
-    y utiliza OpenAI para determinar la estrategia de scraping óptima.
+    y utiliza Gemini para determinar la estrategia de scraping óptima.
     """
     actor = _require_actor(request)
     workspace_id = actor.workspace_id
@@ -3795,10 +3754,9 @@ async def generate_strategy(payload: MagicBoxRequest, request: Request):
         )
         raise HTTPException(status_code=403, detail="No estás autorizado para usar AI sobre otro workspace.")
     ai_config = _workspace_ai_config(workspace_id)
-    openai_api_key = ai_config["openai_api_key"]
     google_api_key = ai_config["google_api_key"]
-    if not openai_api_key and not google_api_key:
-        raise HTTPException(status_code=412, detail="Necesitas API keys para usar Magic Box. Configúralas en API Keys.")
+    if not google_api_key:
+        raise HTTPException(status_code=412, detail="Necesitas tu GOOGLE_API_KEY para usar Magic Box. Configúrala en API Keys.")
 
     system_prompt = '''
     Eres Botardium AI, el cerebro estrategico de MoveUp para prospeccion en Instagram.
@@ -3840,21 +3798,6 @@ async def generate_strategy(payload: MagicBoxRequest, request: Request):
     '''
 
     try:
-        if openai_api_key:
-            client = openai.OpenAI(api_key=openai_api_key)
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": payload.prompt}
-                ],
-                response_format={ "type": "json_object" },
-                temperature=0.2
-            )
-            content = response.choices[0].message.content or "{}"
-            data = json.loads(content)
-            return _normalize_strategy_payload(data, payload.prompt)
-
         if google_api_key and google_genai is not None and google_genai_types is not None:
             client = google_genai.Client(api_key=google_api_key)
             response = client.models.generate_content(
@@ -3867,6 +3810,8 @@ async def generate_strategy(payload: MagicBoxRequest, request: Request):
                 ),
             )
             return _normalize_strategy_payload(_extract_json_from_text(getattr(response, "text", "") or "{}"), payload.prompt)
+
+        return _infer_strategy_fallback(payload.prompt)
 
     except Exception as e:
         print(f"Error AI: {e}")
@@ -3886,7 +3831,6 @@ async def get_workspace_ai_settings(workspace_id: int, request: Request):
     status = _workspace_ai_status(workspace_id)
     return {
         "google_api_key": _mask_key(config["google_api_key"]),
-        "openai_api_key": _mask_key(config["openai_api_key"]),
         **status,
     }
 
@@ -3910,7 +3854,6 @@ async def update_workspace_ai_settings(workspace_id: int, payload: WorkspaceAiSe
     save_workspace_ai_config(
         workspace_id,
         google_api_key=(payload.google_api_key or "").strip(),
-        openai_api_key=(payload.openai_api_key or "").strip(),
     )
     clear_legacy_workspace_ai_secrets(conn, workspace_id)
     conn.commit()
