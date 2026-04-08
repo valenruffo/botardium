@@ -376,11 +376,17 @@ async def run_outreach(
         )
         
         if job_record and job_record.status == JobStatus.COMPLETED.value:
-            logger.info(f"Job {job_id} ya completado anteriormente (idempotency hit)")
+            logger.info(f"Job {job_record.job_id} ya completado anteriormente (idempotency hit)")
             return {"sent": 0, "processed": 0, "errors": 0, "job_status": "completed", "result": json.loads(job_record.result or "{}")}
         
+        if job_record and job_record.status == JobStatus.RUNNING.value:
+            logger.info(f"Job {job_record.job_id} ya está en curso (idempotency hit)")
+            return {"sent": 0, "processed": 0, "errors": 0, "job_status": "running"}
+
+        actual_job_id = job_record.job_id if job_record else job_id
+
         try:
-            with managed_job(job_id, worker_id, job_runtime) as ctx:
+            with managed_job(actual_job_id, worker_id, job_runtime) as ctx:
                 result = await _run_outreach_impl(
                     dry_run=dry_run,
                     lead_ids=lead_ids,
@@ -391,8 +397,8 @@ async def run_outreach(
                 ctx.complete(result)
                 return {**result, "job_status": "completed"}
         except Exception as e:
-            if job_runtime.get_job(job_id):
-                job_runtime.fail_job(job_id, str(e))
+            if job_runtime.get_job(actual_job_id):
+                job_runtime.fail_job(actual_job_id, str(e))
             raise
     else:
         return await _run_outreach_impl(

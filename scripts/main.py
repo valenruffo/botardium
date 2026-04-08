@@ -11,7 +11,7 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--run-warmer":
     from scripts.core_warmer import main as warmer_main
     sys.exit(warmer_main())
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -4380,8 +4380,104 @@ async def preview_messages(payload: MessageStudioRequest, request: Request):
     return {"count": len(previews), "previews": previews}
 
 
+
+def _process_queue_background(job_id: str, actor_workspace_id: int, payload, rows: list, follow_up_due: float, log_file):
+    import sqlite3
+    import traceback
+    from datetime import datetime
+    import time
+    
+    conn = None
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        job = MESSAGE_JOB_STORE.get(job_id)
+        if not job:
+            return
+
+        for idx, lead in enumerate(rows, start=1):
+            log_msg = f"Processing lead {idx}/{len(rows)} - @{lead['username']} (id={lead['id']}, status={lead['status']})"
+            print(f"[DEBUG] bg: {log_msg}")
+            with open(log_file, 'a', encoding='utf-8') as f: f.write(f"{log_msg}\n")
+
+            try:
+                studio_payload = MessageStudioRequest(
+                    workspace_id=actor_workspace_id,
+                    ids=[lead["id"]],
+                    prompt=payload.prompt,
+                    prompt_first_contact=payload.prompt_first_contact,
+                    prompt_follow_up_1=payload.prompt_follow_up_1,
+                    prompt_follow_up_2=payload.prompt_follow_up_2,
+                )
+                bundle = _bundle_for_lead_with_payload(lead, studio_payload)
+                message = bundle["message"]
+            except Exception as e:
+                error_msg = f"FAILED for lead {lead['id']} (@{lead['username']}): {e}"
+                print(f"[ERROR] bg: {error_msg}")
+                _mark_message_job_failed(job_id, f"Error generando mensaje para @{lead['username']}", conn)
+                return
+
+            try:
+                cursor.execute(
+                    """
+                    UPDATE leads
+                    SET status = ?,
+                        last_message_preview = ?,
+                        message_prompt = ?,
+                        message_variant = ?,
+                        last_message_rationale = ?,
+                        sent_at = ?,
+                        follow_up_due_at = ?,
+                        contacted_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "Listo para contactar",
+                        message,
+                        payload.prompt.strip(),
+                        bundle["variant"],
+                        bundle["rationale"],
+                        None,
+                        datetime.fromtimestamp(follow_up_due).isoformat(),
+                        None,
+                        lead["id"],
+                    ),
+                )
+            except Exception as db_err:
+                print(f"[ERROR] bg db update: {db_err}")
+                _mark_message_job_failed(job_id, f"Error guardando mensaje en DB para @{lead['username']}", conn)
+                return
+                
+            try:
+                job["processed"] = idx
+                job["progress"] = int((idx / len(rows)) * 100)
+                job["status"] = "running" if idx < len(rows) else "completed"
+                job["metrics"]["generated"] = idx
+                job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
+                job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
+                job["logs"] = job["logs"][:12]
+                _persist_message_job(job, conn)
+            except Exception as job_err:
+                print(f"[ERROR] bg job persist: {job_err}")
+                _mark_message_job_failed(job_id, "Error persistiendo estado del job", conn)
+                return
+
+        conn.commit()
+        job["status"] = "completed"
+        job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
+        _persist_message_job(job, conn)
+    except Exception as e:
+        print(f"[ERROR] bg unhandled: {e}")
+        if conn: _mark_message_job_failed(job_id, f"Error inesperado en bg: {e}", conn)
+    finally:
+        if conn:
+            conn.close()
+
+
 @app.post("/api/messages/queue")
-async def queue_messages(payload: MessageQueueRequest, request: Request):
+async def queue_messages(payload: MessageQueueRequest, request: Request, background_tasks: BackgroundTasks):
     import sys
     log_file = Path('logs/queue_debug.log')
     log_file.parent.mkdir(exist_ok=True)
@@ -4453,127 +4549,26 @@ async def queue_messages(payload: MessageQueueRequest, request: Request):
 
         now = datetime.now()
         follow_up_due = now.timestamp() + max(1, payload.follow_up_days) * 86400
-        for idx, lead in enumerate(rows, start=1):
-            log_msg = f"Processing lead {idx}/{len(rows)} - @{lead['username']} (id={lead['id']}, status={lead['status']})"
-            print(f"[DEBUG] queue_messages: {log_msg}", file=sys.stderr)
-            with open(log_file, 'a', encoding='utf-8') as f:
-                f.write(f"{log_msg}\n")
-                f.flush()
-            try:
-                studio_payload = MessageStudioRequest(
-                    workspace_id=actor.workspace_id,
-                    ids=[lead["id"]],
-                    prompt=payload.prompt,
-                    prompt_first_contact=payload.prompt_first_contact,
-                    prompt_follow_up_1=payload.prompt_follow_up_1,
-                    prompt_follow_up_2=payload.prompt_follow_up_2,
-                )
-                bundle = _bundle_for_lead_with_payload(lead, studio_payload)
-                log_success = f"Bundle OK for @{lead['username']}: message_len={len(bundle.get('message', ''))}, variant={bundle.get('variant')}"
-                print(f"[DEBUG] {log_success}", file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{log_success}\n")
-                    f.flush()
-                message = bundle["message"]
-            except Exception as e:
-                error_msg = f"FAILED for lead {lead['id']} (@{lead['username']}): {e}"
-                print(f"[ERROR] queue_messages: {error_msg}", file=sys.stderr)
-                import traceback
-                tb = traceback.format_exc()
-                print(tb, file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"ERROR: {error_msg}\n")
-                    f.write(f"TRACEBACK: {tb}\n")
-                    f.flush()
-                _mark_message_job_failed(job_id, f"Error generando mensaje para @{lead['username']}", conn)
-                raise HTTPException(status_code=500, detail=f"Error generando mensaje para @{lead['username']}: {str(e)}")
-            try:
-                cursor.execute(
-                    """
-                    UPDATE leads
-                    SET status = ?,
-                        last_message_preview = ?,
-                        message_prompt = ?,
-                        message_variant = ?,
-                        last_message_rationale = ?,
-                        sent_at = ?,
-                        follow_up_due_at = ?,
-                        contacted_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        "Listo para contactar",
-                        message,
-                        payload.prompt.strip(),
-                        bundle["variant"],
-                        bundle["rationale"],
-                        None,
-                        datetime.fromtimestamp(follow_up_due).isoformat(),
-                        None,
-                        lead["id"],
-                    ),
-                )
-                log_update = f"DB UPDATE OK for @{lead['username']}"
-                print(f"[DEBUG] {log_update}", file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{log_update}\n")
-                    f.flush()
-            except Exception as db_err:
-                log_db_err = f"DB UPDATE FAILED for @{lead['username']}: {db_err}"
-                print(f"[ERROR] {log_db_err}", file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{log_db_err}\n")
-                    f.flush()
-                _mark_message_job_failed(job_id, f"Error guardando mensaje en DB para @{lead['username']}", conn)
-                raise HTTPException(status_code=500, detail=f"Error guardando mensaje en DB: {str(db_err)}")
-            try:
-                job["processed"] = idx
-                job["progress"] = int((idx / len(rows)) * 100)
-                job["status"] = "running" if idx < len(rows) else "completed"
-                job["metrics"]["generated"] = idx
-                job["current_action"] = f"Lead @{lead['username']} agregado a la cola personalizada."
-                job.setdefault("logs", []).insert(0, {"message": job["current_action"], "timestamp": int(time.time())})
-                job["logs"] = job["logs"][:12]
-                _persist_message_job(job, conn)
-                log_job = f"Job persistido OK para @{lead['username']}"
-                print(f"[DEBUG] {log_job}", file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{log_job}\n")
-                    f.flush()
-            except Exception as job_err:
-                log_job_err = f"JOB PERSIST FAILED for @{lead['username']}: {job_err}"
-                print(f"[ERROR] {log_job_err}", file=sys.stderr)
-                with open(log_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{log_job_err}\n")
-                    f.flush()
-                _mark_message_job_failed(job_id, f"Error persistiendo estado del job", conn)
-                raise
+        
+        background_tasks.add_task(
+            _process_queue_background,
+            job_id,
+            actor.workspace_id,
+            payload,
+            rows,
+            follow_up_due,
+            log_file
+        )
 
-        conn.commit()
-        print(f"[DEBUG] queue_messages: Committed DB changes", file=sys.stderr)
-        job["status"] = "completed"
-        job["current_action"] = f"Cola lista. {len(rows)} lead(s) quedaron listos para contactar."
-        _persist_message_job(job, conn)
-        print(f"[DEBUG] queue_messages: Persisted job to DB", file=sys.stderr)
         try:
             _audit_event("message.queue", actor, actor.workspace_id, "allowed", "job", resource_id=job_id)
-            print(f"[DEBUG] queue_messages: Audit event logged", file=sys.stderr)
         except Exception as audit_err:
-            print(f"[WARN] queue_messages: Audit event failed: {audit_err}", file=sys.stderr)
-        print(f"[DEBUG] queue_messages: Returning response with job_id={job_id}", file=sys.stderr)
+            pass
+            
         return {"status": "queued", "job": _serialize_message_job(job)}
     finally:
-        print(f"[DEBUG] queue_messages: FINALLY block running, job_id={job_id}, conn={conn is not None}", file=sys.stderr)
         if conn:
             conn.close()
-            print(f"[DEBUG] queue_messages: FINALLY closed DB connection", file=sys.stderr)
-        if job_id and job_id in MESSAGE_JOB_STORE:
-            job = MESSAGE_JOB_STORE[job_id]
-            print(f"[DEBUG] queue_messages: FINALLY checking job status={job.get('status')}", file=sys.stderr)
-            if job["status"] in {"queued", "running"}:
-                print(f"[DEBUG] queue_messages: FINALLY marking job as failed", file=sys.stderr)
-                _mark_message_job_failed(job_id, "Error inesperado en queue_messages", None)
-
 
 @app.post("/api/messages/run")
 async def run_message_queue(payload: MessageRunRequest, request: Request):
