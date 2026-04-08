@@ -2624,6 +2624,12 @@ def _generate_personalized_message(lead: Dict[str, Any], prompt: str) -> str:
         opener = f"{greeting} te escribo porque creo que vale la pena abrir una conversación breve."
 
     close = prompt.strip()
+    has_placeholder = bool(re.search(r'\[Nombre\]|\[Name\]|\[nombre\]|\[name\]', close, flags=re.IGNORECASE))
+    close = re.sub(r'\[Nombre\]|\[Name\]|\[nombre\]|\[name\]', name_fragment or "ahí", close, flags=re.IGNORECASE)
+    
+    if has_placeholder or re.match(r'^(hola|buen|que|qué|estimad|hello|hi)\b', close, flags=re.IGNORECASE):
+        return close
+
     return f"{opener} {close}".strip()
 
 
@@ -2726,7 +2732,7 @@ def _generate_gemini_message_bundle(system_prompt: str, user_payload: Dict[str, 
     try:
         client = google_genai.Client(api_key=google_api_key)
         response = client.models.generate_content(
-            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
             contents=json.dumps(user_payload, ensure_ascii=False),
             config=google_genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -2756,6 +2762,8 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
     Tu tarea es escribir UN solo mensaje de DM corto, humano y natural.
 
     Reglas duras:
+    - REEMPLAZA siempre placeholders como [Nombre], [Name] o similares usando los datos del lead_context (first_name).
+    - ADAPTA sutilmente el mensaje (spin) para que no sea idéntico entre leads, usando la bio del lead.
     - No pegues el prompt del operador literalmente.
     - No menciones hashtags, source interno, followers, publicaciones ni que viste la bio.
     - No uses frases roboticas como 'hay fit', 'te contacto porque', 'vi tu perfil desde'.
@@ -2794,7 +2802,7 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
                     "message": message,
                     "rationale": rationale or "Mensaje generado por Gemini con tono humano y CTA suave.",
                     "variant": variant,
-                    "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+                    "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
                 }
 
     return fallback_bundle
@@ -3801,7 +3809,7 @@ async def generate_strategy(payload: MagicBoxRequest, request: Request):
         if google_api_key and google_genai is not None and google_genai_types is not None:
             client = google_genai.Client(api_key=google_api_key)
             response = client.models.generate_content(
-                model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash"),
+                model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
                 contents=payload.prompt,
                 config=google_genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
