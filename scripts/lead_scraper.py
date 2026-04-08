@@ -698,7 +698,7 @@ TARGET_KEYWORDS = [
 
 OFFTOPIC_STRONG_TERMS = [
     "noticias", "news", "diario", "periodico", "periodismo", "portal", "radio", "television", "tv",
-    "memes", "humor", "farandula", "chismes", "viral",
+    "memes", "humor", "farandula", "chismes", "viral", "futbol", "deportes", "fan", "fanpage", "club", "racing", "boca", "river"
 ]
 
 EXCLUDE_KEYWORDS = [
@@ -929,14 +929,17 @@ def _gemini_niche_decision(user: dict[str, Any], filters: dict[str, Any], source
         return None
 
     context = filters.get("strategy_context") or {}
-    if not isinstance(context, dict):
-        return None
-
-    intent_summary = str(context.get("intent_summary") or "").strip()
-    include_terms = _normalize_context_values(context.get("include_terms") or [])
-    exclude_terms = _normalize_context_values(context.get("exclude_terms") or [])
+    intent_summary = ""
+    include_terms = []
+    exclude_terms = []
+    
+    if isinstance(context, dict):
+        intent_summary = str(context.get("intent_summary") or "").strip()
+        include_terms = _normalize_context_values(context.get("include_terms") or [])
+        exclude_terms = _normalize_context_values(context.get("exclude_terms") or [])
+        
     if not intent_summary and not include_terms:
-        return None
+        intent_summary = f"Perfiles estrictamente relacionados comercial o profesionalmente con: {source_value}. Rechazar futbol, deportes, memes, farandula, o perfiles personales sin relacion."
 
     profile_payload = {
         "username": str(user.get("username") or "").strip(),
@@ -999,7 +1002,11 @@ def _coherence_mismatch(profile_text: str, source_tokens: list[str], has_keyword
     for term in OFFTOPIC_STRONG_TERMS:
         if term in profile_text:
             mismatch_hits += 1
-    return mismatch_hits >= 2
+            
+    if mismatch_hits >= 1:
+        return True
+        
+    return True
 
 
 def _context_niche_mismatch(profile_text: str, include_terms: list[str], exclude_terms: list[str]) -> bool:
@@ -1125,6 +1132,20 @@ async def _extract_profile_snapshot(page, username: str) -> dict[str, Any]:
     if not is_private and len(og_description.strip()) < 10 and posts_count == 0:
         is_private = True
 
+    is_following = False
+    try:
+        is_following = bool(await page.evaluate(
+            """() => {
+               const btns = Array.from(document.querySelectorAll('header button, header div[role="button"]'));
+               return btns.some(b => {
+                 const text = (b.textContent || '').trim().toLowerCase();
+                 return ['following', 'siguiendo', 'requested', 'pendiente'].includes(text);
+               });
+            }"""
+        ))
+    except Exception as exc:
+        logger.debug("No pude chequear is_following para @%s: %s", username, exc)
+
     return {
         "username": username,
         "full_name": full_name,
@@ -1132,6 +1153,7 @@ async def _extract_profile_snapshot(page, username: str) -> dict[str, Any]:
         "follower_count": followers_count,
         "media_count": posts_count,
         "is_private": is_private,
+        "is_following": is_following,
     }
 
 
@@ -1451,6 +1473,8 @@ def _is_valid_lead(user: dict[str, Any], own_username: str, source_type: str, so
         return False, "self_scraping"
     if user.get("is_private"):
         return False, "privada"
+    if user.get("is_following"):
+        return False, "ya_seguido"
     if any(ex in bio for ex in EXCLUDE_KEYWORDS):
         return False, "keyword_excluida"
 
@@ -1513,18 +1537,26 @@ def _is_valid_lead(user: dict[str, Any], own_username: str, source_type: str, so
             return False, "baja_actividad"
         if require_identity and not has_identity:
             return False, "sin_identidad"
-        if include_terms:
-            if positive_context_hits <= 0 and domain_hits <= 0:
-                gemini_decision = _gemini_niche_decision(user, filters, source_value)
-                if gemini_decision is not None and not gemini_decision[0]:
+        gemini_checked = False
+        gemini_approved = False
+        
+        if positive_context_hits <= 0 and domain_hits <= 0 and not has_keyword and not source_match:
+            gemini_decision = _gemini_niche_decision(user, filters, source_value)
+            if gemini_decision is not None:
+                gemini_checked = True
+                gemini_approved = gemini_decision[0]
+                if not gemini_approved:
                     return False, "perfil_fuera_nicho"
-                # If Gemini is unavailable (None), ACCEPT — better false positive than losing leads
-            if negative_context_hits > positive_context_hits and domain_hits <= 0:
-                gemini_decision = _gemini_niche_decision(user, filters, source_value)
-                if gemini_decision is not None and not gemini_decision[0]:
+                    
+        elif include_terms and negative_context_hits > positive_context_hits and domain_hits <= 0:
+            gemini_decision = _gemini_niche_decision(user, filters, source_value)
+            if gemini_decision is not None:
+                gemini_checked = True
+                gemini_approved = gemini_decision[0]
+                if not gemini_approved:
                     return False, "perfil_fuera_nicho"
-                # If Gemini is unavailable (None), ACCEPT
-        if require_coherence and _coherence_mismatch(profile_text, source_domain_tokens, has_keyword, bool(domain_hits > 0)):
+
+        if require_coherence and not gemini_approved and _coherence_mismatch(profile_text, source_domain_tokens, has_keyword, bool(domain_hits > 0)):
             return False, "perfil_fuera_nicho"
         return True, "ok"
 
