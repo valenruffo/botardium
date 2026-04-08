@@ -970,7 +970,7 @@ def _gemini_niche_decision(user: dict[str, Any], filters: dict[str, Any], source
     try:
         client = google_genai.Client(api_key=GOOGLE_API_KEY)
         response = client.models.generate_content(
-            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
+            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash-preview"),
             contents=json.dumps(profile_payload, ensure_ascii=False),
             config=google_genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,

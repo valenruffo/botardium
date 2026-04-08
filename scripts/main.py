@@ -2732,7 +2732,7 @@ def _generate_gemini_message_bundle(system_prompt: str, user_payload: Dict[str, 
     try:
         client = google_genai.Client(api_key=google_api_key)
         response = client.models.generate_content(
-            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
+            model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash-preview"),
             contents=json.dumps(user_payload, ensure_ascii=False),
             config=google_genai_types.GenerateContentConfig(
                 system_instruction=system_prompt,
@@ -2802,7 +2802,7 @@ def _generate_ai_message_bundle(lead: Dict[str, Any], stage_prompt: str, master_
                     "message": message,
                     "rationale": rationale or "Mensaje generado por Gemini con tono humano y CTA suave.",
                     "variant": variant,
-                    "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
+                    "provider": os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash-preview"),
                 }
 
     return fallback_bundle
@@ -3809,7 +3809,7 @@ async def generate_strategy(payload: MagicBoxRequest, request: Request):
         if google_api_key and google_genai is not None and google_genai_types is not None:
             client = google_genai.Client(api_key=google_api_key)
             response = client.models.generate_content(
-                model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-2.5-flash"),
+                model=os.getenv("GOOGLE_FLASH_MODEL", "gemini-3-flash-preview"),
                 contents=payload.prompt,
                 config=google_genai_types.GenerateContentConfig(
                     system_instruction=system_prompt,
